@@ -1,0 +1,2082 @@
+/*
+ * renderer.c - OpenGL 3.3 Core Profile renderer
+ */
+#include "renderer.h"
+#include "weapon.h"  /* for g_weapon_defs in HUD ammo display */
+#include "font5x7.h" /* embedded font for on-screen messages */
+#include <GL/glew.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <math.h>
+
+/* -------------------------------------------------------------------------
+ * Shader sources (embedded GLSL 3.30)
+ * ---------------------------------------------------------------------- */
+
+static const char *WORLD_VERT_SRC =
+"#version 330 core\n"
+"layout(location=0) in vec3 aPos;\n"
+"layout(location=1) in vec2 aUV;\n"
+"uniform vec2 uUVOffset;\n"
+"layout(location=2) in float aLight;\n"
+"out vec2 vUV;\n"
+"out float vLight;\n"
+"uniform mat4 uMVP;\n"
+"void main() {\n"
+"    gl_Position = uMVP * vec4(aPos, 1.0);\n"
+"    vUV = aUV + uUVOffset;\n"
+"    vLight = aLight;\n"
+"}\n";
+
+static const char *WORLD_FRAG_SRC =
+"#version 330 core\n"
+"in vec2 vUV;\n"
+"in float vLight;\n"
+"out vec4 fragColor;\n"
+"uniform sampler2D uTex;\n"
+"uniform float uAmbient;\n"
+"void main() {\n"
+"    vec4 col = texture(uTex, vUV);\n"
+"    if (col.a < 0.1) discard;\n"
+"    float light = clamp(uAmbient + vLight, 0.0, 1.0);\n"
+"    fragColor = vec4(col.rgb * light, col.a);\n"
+"}\n";
+
+static const char *SPRITE_VERT_SRC =
+"#version 330 core\n"
+"layout(location=0) in vec3 aPos;\n"
+"layout(location=1) in vec2 aUV;\n"
+"layout(location=2) in vec4 aColor;\n"
+"out vec2 vUV;\n"
+"out vec4 vColor;\n"
+"uniform mat4 uMVP;\n"
+"void main() {\n"
+"    gl_Position = uMVP * vec4(aPos, 1.0);\n"
+"    vUV = aUV;\n"
+"    vColor = aColor;\n"
+"}\n";
+
+static const char *SPRITE_FRAG_SRC =
+"#version 330 core\n"
+"in vec2 vUV;\n"
+"in vec4 vColor;\n"
+"out vec4 fragColor;\n"
+"uniform sampler2D uTex;\n"
+"uniform bool uHasTex;\n"
+"void main() {\n"
+"    if (uHasTex) {\n"
+"        vec4 col = texture(uTex, vUV);\n"
+"        if (col.a < 0.1) discard;\n"
+"        fragColor = col * vColor;\n"
+"    } else {\n"
+"        fragColor = vColor;\n"
+"    }\n"
+"}\n";
+
+/* 2D HUD shader */
+static const char *HUD_VERT_SRC =
+"#version 330 core\n"
+"layout(location=0) in vec2 aPos;\n"
+"layout(location=1) in vec2 aUV;\n"
+"layout(location=2) in vec4 aColor;\n"
+"out vec2 vUV;\n"
+"out vec4 vColor;\n"
+"uniform mat4 uOrtho;\n"
+"void main() {\n"
+"    gl_Position = uOrtho * vec4(aPos, 0.0, 1.0);\n"
+"    vUV = aUV;\n"
+"    vColor = aColor;\n"
+"}\n";
+
+static const char *HUD_FRAG_SRC =
+"#version 330 core\n"
+"in vec2 vUV;\n"
+"in vec4 vColor;\n"
+"out vec4 fragColor;\n"
+"uniform sampler2D uTex;\n"
+"uniform bool uHasTex;\n"
+"void main() {\n"
+"    if (uHasTex) {\n"
+"        vec4 t = texture(uTex, vUV);\n"
+"        if (t.a < 0.1) discard;\n"
+"        fragColor = t * vColor;\n"
+"    } else {\n"
+"        fragColor = vColor;\n"
+"    }\n"
+"}\n";
+
+/* -------------------------------------------------------------------------
+ * Shader compilation helpers
+ * ---------------------------------------------------------------------- */
+
+static GLuint compile_shader(GLenum type, const char *src) {
+    GLuint sh = glCreateShader(type);
+    glShaderSource(sh, 1, &src, NULL);
+    glCompileShader(sh);
+    GLint ok; glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[1024];
+        glGetShaderInfoLog(sh, sizeof(log), NULL, log);
+        OL_ERR("Shader compile error: %s\n", log);
+        glDeleteShader(sh); return 0;
+    }
+    return sh;
+}
+
+static GLuint link_program(const char *vert_src, const char *frag_src) {
+    GLuint vert = compile_shader(GL_VERTEX_SHADER,   vert_src);
+    GLuint frag = compile_shader(GL_FRAGMENT_SHADER, frag_src);
+    if (!vert || !frag) {
+        glDeleteShader(vert); glDeleteShader(frag); return 0;
+    }
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, vert); glAttachShader(prog, frag);
+    glLinkProgram(prog);
+    glDeleteShader(vert); glDeleteShader(frag);
+    GLint ok; glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[1024]; glGetProgramInfoLog(prog, sizeof(log), NULL, log);
+        OL_ERR("Shader link error: %s\n", log);
+        glDeleteProgram(prog); return 0;
+    }
+    return prog;
+}
+
+/* -------------------------------------------------------------------------
+ * Renderer init / shutdown
+ * ---------------------------------------------------------------------- */
+
+bool renderer_init(Renderer *r, const RenderConfig *cfg, const char *title) {
+    memset(r, 0, sizeof(*r));
+    r->cfg = *cfg;
+
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) < 0) {
+        OL_ERR("SDL_Init failed: %s\n", SDL_GetError()); return false;
+    }
+
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+
+    r->window = SDL_CreateWindow(title,
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+        cfg->width, cfg->height,
+        SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+    if (!r->window) {
+        OL_ERR("SDL_CreateWindow failed: %s\n", SDL_GetError()); return false;
+    }
+
+    r->gl_ctx = SDL_GL_CreateContext(r->window);
+    if (!r->gl_ctx) {
+        OL_ERR("SDL_GL_CreateContext failed: %s\n", SDL_GetError()); return false;
+    }
+    SDL_GL_SetSwapInterval(1);
+
+    glewExperimental = GL_TRUE;
+    GLenum glew_err = glewInit();
+    if (glew_err != GLEW_OK) {
+        OL_ERR("glewInit failed: %s\n", glewGetErrorString(glew_err)); return false;
+    }
+
+    OL_LOG("OpenGL: %s\n", glGetString(GL_VERSION));
+    OL_LOG("Renderer: %s\n", glGetString(GL_RENDERER));
+
+    /* Compile shaders */
+    r->prog_world  = link_program(WORLD_VERT_SRC,  WORLD_FRAG_SRC);
+    r->prog_sprite = link_program(SPRITE_VERT_SRC, SPRITE_FRAG_SRC);
+    r->prog_hud    = link_program(HUD_VERT_SRC,    HUD_FRAG_SRC);
+    if (!r->prog_world || !r->prog_sprite || !r->prog_hud) return false;
+
+    /* GL state defaults */
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LEQUAL); /* LEQUAL: floor polygons at same depth as wall base edges pass */
+    /* Back-face culling: winding is interior-facing after Z-negation correction */
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
+    glFrontFace(GL_CCW);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    /* Sky blue: visible through outdoor sectors with high ceilings */
+    glClearColor(0.38f, 0.60f, 0.88f, 1.0f);
+
+    /* Projection matrix.
+     * cfg->fov is HORIZONTAL FOV in degrees (Outlaws used 90° horizontal).
+     * mat4_perspective takes vertical FOV, so convert: vfov = 2*atan(tan(hfov/2)/aspect). */
+    f32 hfov_rad = cfg->fov * OL_DEG2RAD;
+    f32 aspect   = (f32)cfg->width / (f32)cfg->height;
+    f32 fov_rad  = 2.0f * atanf(tanf(hfov_rad * 0.5f) / aspect);
+    r->proj = mat4_perspective(fov_rad, aspect, cfg->near_plane, cfg->far_plane);
+    r->cam_fov_rad = fov_rad;
+
+    /* Sprite dynamic VBO (updated each frame, enough for 2048 sprites * 4 verts) */
+    glGenVertexArrays(1, &r->sprite_vao);
+    glGenBuffers(1, &r->sprite_vbo);
+    glBindVertexArray(r->sprite_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, r->sprite_vbo);
+    glBufferData(GL_ARRAY_BUFFER, 2048 * 6 * (3+2+4) * sizeof(f32), NULL, GL_DYNAMIC_DRAW);
+    /* Attrib 0: pos (3 f32) */
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, (3+2+4)*sizeof(f32), (void*)0);
+    glEnableVertexAttribArray(0);
+    /* Attrib 1: uv (2 f32) */
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, (3+2+4)*sizeof(f32), (void*)(3*sizeof(f32)));
+    glEnableVertexAttribArray(1);
+    /* Attrib 2: color (4 f32) */
+    glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, (3+2+4)*sizeof(f32), (void*)(5*sizeof(f32)));
+    glEnableVertexAttribArray(2);
+    glBindVertexArray(0);
+
+    /* HUD dynamic VBO */
+    glGenVertexArrays(1, &r->hud_vao);
+    glGenBuffers(1, &r->hud_vbo);
+    glBindVertexArray(r->hud_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, r->hud_vbo);
+    glBufferData(GL_ARRAY_BUFFER, 1024 * 6 * (2+2+4) * sizeof(f32), NULL, GL_DYNAMIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, (2+2+4)*sizeof(f32), (void*)0);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, (2+2+4)*sizeof(f32), (void*)(2*sizeof(f32)));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, (2+2+4)*sizeof(f32), (void*)(4*sizeof(f32)));
+    glEnableVertexAttribArray(2);
+    glBindVertexArray(0);
+
+    /* Missing texture: 2x2 magenta checkerboard */
+    {
+        u8 data[4*4] = { 255,0,255,255, 0,0,0,255, 0,0,0,255, 255,0,255,255 };
+        glGenTextures(1, &r->missing_tex);
+        glBindTexture(GL_TEXTURE_2D, r->missing_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 2, 2, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+
+    OL_LOG("Renderer initialized (%dx%d)\n", cfg->width, cfg->height);
+    return true;
+}
+
+void renderer_shutdown(Renderer *r) {
+    /* Free level meshes */
+    if (r->level_meshes) {
+        for (u32 i = 0; i < r->level_mesh_count; i++) {
+            glDeleteVertexArrays(1, &r->level_meshes[i].vao);
+            glDeleteBuffers(1, &r->level_meshes[i].vbo);
+            glDeleteBuffers(1, &r->level_meshes[i].ibo);
+        }
+        free(r->level_meshes);
+    }
+
+    /* Delete textures */
+    for (u32 i = 0; i < r->texture_count; i++) {
+        if (r->textures[i].handle) glDeleteTextures(1, &r->textures[i].handle);
+    }
+
+    if (r->prog_world)  glDeleteProgram(r->prog_world);
+    if (r->prog_sprite) glDeleteProgram(r->prog_sprite);
+    if (r->prog_hud)    glDeleteProgram(r->prog_hud);
+
+    if (r->sprite_vao) { glDeleteVertexArrays(1, &r->sprite_vao); glDeleteBuffers(1, &r->sprite_vbo); }
+    if (r->hud_vao)    { glDeleteVertexArrays(1, &r->hud_vao);    glDeleteBuffers(1, &r->hud_vbo); }
+    if (r->missing_tex) glDeleteTextures(1, &r->missing_tex);
+
+    if (r->gl_ctx)  SDL_GL_DeleteContext(r->gl_ctx);
+    if (r->window)  SDL_DestroyWindow(r->window);
+    SDL_Quit();
+}
+
+/* -------------------------------------------------------------------------
+ * Frame management
+ * ---------------------------------------------------------------------- */
+
+void renderer_begin_frame(Renderer *r) {
+    (void)r;
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+}
+
+void renderer_end_frame(Renderer *r) {
+    SDL_GL_SwapWindow(r->window);
+}
+
+/* -------------------------------------------------------------------------
+ * Texture management
+ * ---------------------------------------------------------------------- */
+
+u32 renderer_upload_texture(Renderer *r, const char *name,
+                            const u8 *rgba, u32 w, u32 h) {
+    /* Check for existing */
+    u32 existing = renderer_find_texture(r, name);
+    if (existing) return existing;
+
+    if (r->texture_count >= R_MAX_TEXTURES) {
+        OL_WARN("Texture cache full! Cannot upload '%s'\n", name); return 0;
+    }
+
+    GLuint handle;
+    glGenTextures(1, &handle);
+    glBindTexture(GL_TEXTURE_2D, handle);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)w, (GLsizei)h,
+                 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    u32 idx = r->texture_count++;
+    r->textures[idx].handle = handle;
+    r->textures[idx].width  = w;
+    r->textures[idx].height = h;
+    snprintf(r->textures[idx].name, sizeof(r->textures[idx].name), "%s", name);
+    return idx + 1; /* 1-based index, 0 = "no texture" */
+}
+
+u32 renderer_find_texture(const Renderer *r, const char *name) {
+    char lower[64]; snprintf(lower, sizeof(lower), "%s", name);
+    for (char *p = lower; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 32;
+    for (u32 i = 0; i < r->texture_count; i++) {
+        if (strcmp(r->textures[i].name, lower) == 0) return i + 1;
+    }
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * Animated texture management
+ * ---------------------------------------------------------------------- */
+
+void renderer_add_anim_texture(Renderer *r, u32 base_tex,
+                               const GLuint *frame_handles, u32 count, f32 fps,
+                               bool loop, u32 loop_start) {
+    /* A single-frame static ATX (STOP after frame 0) still needs to pin its
+     * base texture to frame 0, but has nothing to animate. */
+    if (!base_tex || count < 1 || fps <= 0.0f) return;
+    if (r->anim_texture_count >= R_MAX_ANIM_TEXTURES) {
+        OL_WARN("AnimTexture table full\n"); return;
+    }
+    AnimTexture *at = &r->anim_textures[r->anim_texture_count++];
+    memset(at, 0, sizeof(*at));
+    at->base_tex = base_tex;
+    u32 n = (count < R_MAX_ANIM_FRAMES) ? count : R_MAX_ANIM_FRAMES;
+    for (u32 i = 0; i < n; i++) at->frame_handles[i] = frame_handles[i];
+    at->frame_count   = n;
+    at->fps           = fps;
+    at->current_frame = 0;
+    at->loop          = loop && n >= 2;
+    at->loop_start    = (loop_start < n) ? loop_start : 0;
+}
+
+void renderer_update_anim_textures(Renderer *r, f32 dt) {
+    for (u32 i = 0; i < r->anim_texture_count; i++) {
+        AnimTexture *at = &r->anim_textures[i];
+        if (at->frame_count < 2 || at->fps <= 0.0f) continue;
+
+        /* Static (STOP) textures hold frame 0; only looping ones advance. */
+        if (at->loop) {
+            at->timer += dt;
+            f32 frame_time = 1.0f / at->fps;
+            u32 span = at->frame_count - at->loop_start;
+            if (span < 1) span = 1;
+            while (at->timer >= frame_time) {
+                at->timer -= frame_time;
+                at->current_frame++;
+                if (at->current_frame >= at->frame_count)
+                    at->current_frame = at->loop_start;
+            }
+        } else {
+            at->current_frame = 0;
+        }
+
+        /* Swap the GL handle in the base texture slot to the current frame */
+        u32 bt = at->base_tex;
+        if (bt > 0 && bt <= r->texture_count)
+            r->textures[bt - 1].handle = at->frame_handles[at->current_frame];
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * Level geometry building
+ *
+ * For each sector we generate:
+ *   - Floor polygon (triangle fan)
+ *   - Ceiling polygon (triangle fan, reversed winding)
+ *   - Wall quads (one per wall segment, or multiple for portal walls)
+ *
+ * Texture coordinates:
+ *   Walls: u = distance along wall / texture_width, v = height / texture_height
+ *   Floor/Ceiling: u = x / 64, v = z / 64 (world units per tile)
+ *
+ * Coordinate system conversion (LVT → OpenGL):
+ *   LVT: X right, Z forward, Y up
+ *   GL:  X right, Y up, Z out of screen
+ *   We map: LVT(X, Y, Z) → GL(X, Y, -Z)
+ * ---------------------------------------------------------------------- */
+
+/* Texture repeat scale: 1 world unit = 1/64 texture tiles */
+/* Jedi Engine: 1 world unit = 8 texels.
+ * UV = world_pos * 8 / texture_pixel_dimension.
+ * For 64px texture: UV = pos * 8/64 = pos/8 → repeats every 8 wu.
+ * For 128px texture: UV = pos * 8/128 = pos/16 → repeats every 16 wu.
+ * WU_TO_TEXEL converts world units to texels (multiply by 8). */
+#define WU_TO_TEXEL 8.0f
+
+typedef struct {
+    WorldVertex *verts;
+    u32         *indices;
+    u32          vert_count, vert_cap;
+    u32          idx_count,  idx_cap;
+    u32          tex_id;
+} MeshBuilder;
+
+static void mb_init(MeshBuilder *mb, u32 tex_id) {
+    memset(mb, 0, sizeof(*mb));
+    mb->tex_id = tex_id;
+}
+
+static void mb_push_vert(MeshBuilder *mb, WorldVertex v) {
+    if (mb->vert_count >= mb->vert_cap) {
+        mb->vert_cap = mb->vert_cap ? mb->vert_cap * 2 : 64;
+        mb->verts = realloc(mb->verts, mb->vert_cap * sizeof(WorldVertex));
+    }
+    mb->verts[mb->vert_count++] = v;
+}
+
+static void mb_push_idx(MeshBuilder *mb, u32 idx) {
+    if (mb->idx_count >= mb->idx_cap) {
+        mb->idx_cap = mb->idx_cap ? mb->idx_cap * 2 : 64;
+        mb->indices = realloc(mb->indices, mb->idx_cap * sizeof(u32));
+    }
+    mb->indices[mb->idx_count++] = idx;
+}
+
+static RenderMesh mb_upload(MeshBuilder *mb) {
+    RenderMesh mesh = {0};
+    if (!mb->vert_count || !mb->idx_count) return mesh;
+
+    glGenVertexArrays(1, &mesh.vao);
+    glGenBuffers(1, &mesh.vbo);
+    glGenBuffers(1, &mesh.ibo);
+
+    glBindVertexArray(mesh.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, mesh.vbo);
+    glBufferData(GL_ARRAY_BUFFER, mb->vert_count * sizeof(WorldVertex),
+                 mb->verts, GL_STATIC_DRAW);
+
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh.ibo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, mb->idx_count * sizeof(u32),
+                 mb->indices, GL_STATIC_DRAW);
+
+    /* pos: location 0, 3 floats */
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(WorldVertex),
+                          (void*)offsetof(WorldVertex, x));
+    glEnableVertexAttribArray(0);
+    /* uv: location 1, 2 floats */
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(WorldVertex),
+                          (void*)offsetof(WorldVertex, u));
+    glEnableVertexAttribArray(1);
+    /* light: location 2, 1 float */
+    glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, sizeof(WorldVertex),
+                          (void*)offsetof(WorldVertex, light));
+    glEnableVertexAttribArray(2);
+
+    glBindVertexArray(0);
+
+    mesh.index_count = mb->idx_count;
+    mesh.tex_id      = mb->tex_id;
+    free(mb->verts); free(mb->indices);
+    return mesh;
+}
+
+/*
+ * Build a textured wall quad between two vertices at given floor/ceiling Y.
+ * Adds 4 vertices and 6 indices (2 triangles) to the builder.
+ */
+static void build_wall_quad(MeshBuilder *mb,
+                             f32 x0, f32 z0, f32 x1, f32 z1,
+                             f32 y_bot, f32 y_top,
+                             f32 u_off, f32 v_off,
+                             f32 ambient_norm, u32 flags,
+                             u32 tex_w, u32 tex_h) {
+    /* Wall length for texture U coordinate */
+    f32 dx = x1 - x0, dz = z1 - z0;
+    f32 wall_len = sqrtf(dx*dx + dz*dz);
+    f32 wall_h   = y_top - y_bot;
+
+    /* UV scale: 1 world unit = 8 texels. UV = world * 8 / tex_dim. */
+    f32 u_scale = (tex_w > 0) ? (WU_TO_TEXEL / (f32)tex_w) : (WU_TO_TEXEL / 64.0f);
+    f32 v_scale = (tex_h > 0) ? (WU_TO_TEXEL / (f32)tex_h) : (WU_TO_TEXEL / 64.0f);
+
+    f32 u0 = u_off * u_scale;
+    f32 u1 = (u_off + wall_len) * u_scale;
+
+    f32 v_top, v_bot;
+    if (flags & 0x40u) {
+        /* TEX_ANCHORED (bit 6): bottom-pegged. Texture pinned to floor.
+         * RE docs: "pinned to the floor so it doesn't shift when ceiling moves" */
+        v_bot = (v_off + wall_h) * v_scale;
+        v_top = v_off * v_scale;
+    } else {
+        /* Default: top-pegged. Texture pinned to ceiling. */
+        v_top = v_off * v_scale;
+        v_bot = (v_off + wall_h) * v_scale;
+    }
+
+    /* Flag 0x04: flip U (horizontal).
+     * RE docs: "u = (tex_width - u) - 1 after wrap" */
+    if (flags & 0x04u) {
+        f32 tmp = u0; u0 = u1; u1 = tmp;
+    }
+
+    u32 base = mb->vert_count;
+
+    /* Bottom-left, bottom-right, top-right, top-left */
+    WorldVertex verts[4] = {
+        { x0, y_bot, -z0, u0, v_bot, ambient_norm },
+        { x1, y_bot, -z1, u1, v_bot, ambient_norm },
+        { x1, y_top, -z1, u1, v_top, ambient_norm },
+        { x0, y_top, -z0, u0, v_top, ambient_norm },
+    };
+    for (int i = 0; i < 4; i++) mb_push_vert(mb, verts[i]);
+
+    /* CW triangles (interior-facing after LVT→GL Z-negation flips winding) */
+    mb_push_idx(mb, base+0); mb_push_idx(mb, base+2); mb_push_idx(mb, base+1);
+    mb_push_idx(mb, base+0); mb_push_idx(mb, base+3); mb_push_idx(mb, base+2);
+}
+
+/*
+ * Compute per-vertex Y for a sloped floor/ceiling.
+ * The slope is defined by a pivot wall edge and an angle.
+ * Angle is in 14-bit fixed point: 16384 = 90 degrees.
+ */
+static f32 slope_y_at(const LvtSector *sec, f32 base_y,
+                       i32 wall_idx, i32 angle_fixed,
+                       f32 vx, f32 vz) {
+    /* Exact Outlaws/TFE slope plane — shared with collision (lvt.c). */
+    return lvt_slope_height(sec, base_y, wall_idx, angle_fixed, vx, vz);
+}
+
+/*
+ * Build a textured floor/ceiling polygon (triangle fan).
+ * verts_xz: array of Vec2 (X,Z) in sector order
+ * y: base height of the plane
+ * flip_winding: true for ceiling (reverse face direction)
+ * sec: sector pointer (for slope computation, may be NULL)
+ * is_floor: true for floor, false for ceiling
+ */
+static void build_floor_poly(MeshBuilder *mb,
+                              const Vec2 *verts_xz, u32 count,
+                              f32 y, f32 u_off, f32 v_off,
+                              bool flip_winding, f32 ambient_norm,
+                              const LvtSector *sec, bool is_floor,
+                              u32 tex_w, u32 tex_h) {
+    if (count < 3) return;
+
+    /* Check for slope */
+    bool has_slope = false;
+    i32 slope_wall = 0, slope_angle = 0;
+    if (sec) {
+        if (is_floor && sec->has_slope_floor) {
+            has_slope = true;
+            slope_wall  = sec->slope_floor_wall;
+            slope_angle = sec->slope_floor_angle;
+        } else if (!is_floor && sec->has_slope_ceil) {
+            has_slope = true;
+            slope_wall  = sec->slope_ceil_wall;
+            slope_angle = sec->slope_ceil_angle;
+        }
+    }
+
+    u32 base = mb->vert_count;
+    for (u32 i = 0; i < count; i++) {
+        WorldVertex v;
+        v.x = verts_xz[i].x;
+        v.y = has_slope
+              ? slope_y_at(sec, y, slope_wall, slope_angle,
+                           verts_xz[i].x, verts_xz[i].y)
+              : y;
+        v.z = -verts_xz[i].y;  /* LVT Z → GL -Z */
+        f32 fu_scale = (tex_w > 0) ? (WU_TO_TEXEL / (f32)tex_w) : (WU_TO_TEXEL / 64.0f);
+        f32 fv_scale = (tex_h > 0) ? (WU_TO_TEXEL / (f32)tex_h) : (WU_TO_TEXEL / 64.0f);
+        v.u = (u_off + verts_xz[i].x) * fu_scale;
+        v.v = (v_off + verts_xz[i].y) * fv_scale;
+        v.light = ambient_norm;
+        mb_push_vert(mb, v);
+    }
+
+    /* Ear-clipping tessellation for concave polygon support.
+     * Falls back to triangle fan if ear-clipping stalls. */
+    {
+        u32 idx[LVT_MAX_VERTICES];
+        u32 n = count;
+        if (n > LVT_MAX_VERTICES) n = LVT_MAX_VERTICES;
+        for (u32 i = 0; i < n; i++) idx[i] = i;
+
+        /* Signed area to determine winding */
+        f32 area2 = 0;
+        for (u32 i = 0; i < n; i++) {
+            u32 j = (i + 1) % n;
+            area2 += verts_xz[i].x * verts_xz[j].y
+                   - verts_xz[j].x * verts_xz[i].y;
+        }
+        bool ccw = (area2 > 0);
+
+        u32 fail_count = 0;
+        while (n > 2) {
+            bool found = false;
+            for (u32 i = 0; i < n; i++) {
+                u32 p = (i + n - 1) % n;
+                u32 nx = (i + 1) % n;
+                f32 ax = verts_xz[idx[p]].x,  ay = verts_xz[idx[p]].y;
+                f32 bx = verts_xz[idx[i]].x,  by = verts_xz[idx[i]].y;
+                f32 cx = verts_xz[idx[nx]].x, cy = verts_xz[idx[nx]].y;
+
+                f32 cross = (bx-ax)*(cy-ay) - (by-ay)*(cx-ax);
+                /* Convex check with small epsilon to handle collinear */
+                bool convex = ccw ? (cross > -1e-6f) : (cross < 1e-6f);
+                if (!convex) continue;
+
+                /* Skip near-degenerate triangles */
+                if (fabsf(cross) < 1e-8f) continue;
+
+                /* Check no other vertex strictly inside this triangle */
+                bool ear = true;
+                for (u32 k = 0; k < n && ear; k++) {
+                    if (k == p || k == i || k == nx) continue;
+                    f32 px = verts_xz[idx[k]].x, py = verts_xz[idx[k]].y;
+                    f32 d1 = (px-ax)*(by-ay) - (bx-ax)*(py-ay);
+                    f32 d2 = (px-bx)*(cy-by) - (cx-bx)*(py-by);
+                    f32 d3 = (px-cx)*(ay-cy) - (ax-cx)*(py-cy);
+                    bool all_neg = (d1 <= 0) && (d2 <= 0) && (d3 <= 0);
+                    bool all_pos = (d1 >= 0) && (d2 >= 0) && (d3 >= 0);
+                    if (all_neg || all_pos) ear = false;
+                }
+                if (!ear) continue;
+
+                if (flip_winding) {
+                    mb_push_idx(mb, base + idx[p]);
+                    mb_push_idx(mb, base + idx[nx]);
+                    mb_push_idx(mb, base + idx[i]);
+                } else {
+                    mb_push_idx(mb, base + idx[p]);
+                    mb_push_idx(mb, base + idx[i]);
+                    mb_push_idx(mb, base + idx[nx]);
+                }
+                for (u32 j = i; j + 1 < n; j++) idx[j] = idx[j + 1];
+                n--;
+                found = true;
+                fail_count = 0;
+                break;
+            }
+            if (!found) {
+                fail_count++;
+                if (fail_count > n) {
+                    /* Fallback: fan remaining vertices to avoid holes */
+                    for (u32 i = 1; i + 1 < n; i++) {
+                        if (flip_winding) {
+                            mb_push_idx(mb, base + idx[0]);
+                            mb_push_idx(mb, base + idx[i + 1]);
+                            mb_push_idx(mb, base + idx[i]);
+                        } else {
+                            mb_push_idx(mb, base + idx[0]);
+                            mb_push_idx(mb, base + idx[i]);
+                            mb_push_idx(mb, base + idx[i + 1]);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+}
+
+/* Resolve texture id (1-based, 0 = no texture). Clamps to valid range. */
+static u32 resolve_tex(const Renderer *r, const LvtLevel *level, i32 tex_idx) {
+    if (tex_idx < 0 || (u32)tex_idx >= level->texture_count) return 0;
+    u32 id = renderer_find_texture(r, level->textures[tex_idx]);
+    return (id < R_MAX_TEXTURES) ? id : 0;
+}
+
+/* Get texture pixel dimensions (0,0 if not found). */
+static void tex_dims(const Renderer *r, u32 tex_id, u32 *w, u32 *h) {
+    if (tex_id > 0 && tex_id <= r->texture_count) {
+        *w = r->textures[tex_id - 1].width;
+        *h = r->textures[tex_id - 1].height;
+    } else {
+        *w = 64; *h = 64;
+    }
+}
+
+bool renderer_build_level(Renderer *r, const LvtLevel *level, const InfSystem *inf) {
+    /* Free old meshes */
+    if (r->level_meshes) {
+        for (u32 i = 0; i < r->level_mesh_count; i++) {
+            glDeleteVertexArrays(1, &r->level_meshes[i].vao);
+            glDeleteBuffers(1, &r->level_meshes[i].vbo);
+            glDeleteBuffers(1, &r->level_meshes[i].ibo);
+        }
+        free(r->level_meshes);
+        r->level_meshes = NULL;
+        r->level_mesh_count = 0;
+    }
+
+    if (!level || level->sector_count == 0) return false;
+
+    /* DEFAULT.PCX texture ID: uploaded as neutral gray; skip on portal mid-slots
+     * (open portals use it as a placeholder meaning "no fence here"). */
+    u32 default_pcx_tex = renderer_find_texture(r, "default.pcx");
+
+    /*
+     * Texture-batched builders (one per texture slot).
+     * Scroll-floor sectors get their own per-sector builders so UV offset
+     * can be applied independently each frame.
+     */
+    MeshBuilder *builders = calloc(R_MAX_TEXTURES + 1, sizeof(MeshBuilder));
+    if (!builders) return false;
+
+    /* Builder 0 = no texture (debug purple) */
+    mb_init(&builders[0], 0);
+    for (u32 i = 1; i <= r->texture_count; i++) mb_init(&builders[i], i);
+
+    /* Per-sector scroll floor builders (one per scroll-floor sector).
+     * Indexed as scroll_si[i] = sector index, scroll_mb[i] = its builder. */
+    u32        scroll_si[INF_MAX_ELEVS];
+    MeshBuilder scroll_mb[INF_MAX_ELEVS];
+    u32        scroll_count = 0;
+
+    u32 dbg_floors = 0;
+
+    for (u32 si = 0; si < level->sector_count; si++) {
+        const LvtSector *sec = &level->sectors[si];
+        f32 ambient = OL_CLAMP((f32)sec->ambient / 31.0f, 0.0f, 1.0f);
+
+        bool is_scroll = inf && inf_is_scroll_floor(inf, si);
+
+        /* Floor and ceiling polygons.
+         * ALWAYS trace wall chains to find individual polygon loops.
+         * Multi-loop sectors (99 in TOWN) have disconnected wall loops
+         * sharing the same vertex array — using raw vertex order creates
+         * self-intersecting triangle fans that cover adjacent sectors' floors.
+         * Rendering each loop separately avoids this. */
+        if (sec->vertex_count >= 3 && sec->wall_count >= 3) {
+            /* Trace wall chains to find ALL loops */
+            Vec2 traced[LVT_MAX_VERTICES];
+            u32  loff[64], lsz[64], lcnt = 0;
+            u32  toff = 0;
+            bool wused[LVT_MAX_WALLS];
+            memset(wused, 0, sec->wall_count * sizeof(bool));
+
+            for (u32 st = 0; st < sec->wall_count && lcnt < 64; st++) {
+                if (wused[st]) continue;
+                u32 lv = 0, cur = st;
+                for (u32 s = 0; s < sec->wall_count; s++) {
+                    if (wused[cur]) break;
+                    wused[cur] = true;
+                    i32 vi = sec->walls[cur].v1;
+                    if (vi >= 0 && vi < (i32)sec->vertex_count && toff + lv < LVT_MAX_VERTICES)
+                        traced[toff + lv++] = sec->vertices[vi];
+                    i32 v2 = sec->walls[cur].v2;
+                    bool found = false;
+                    for (u32 nx = 0; nx < sec->wall_count; nx++) {
+                        if (!wused[nx] && sec->walls[nx].v1 == v2) {
+                            cur = nx; found = true; break;
+                        }
+                    }
+                    if (!found) break;
+                }
+                if (lv >= 3) {
+                    loff[lcnt] = toff;
+                    lsz[lcnt] = lv;
+                    lcnt++;
+                    toff += lv;
+                }
+            }
+
+            /* Render floor for EVERY loop */
+            u32 ftex = resolve_tex(r, level, sec->floor_tex);
+            if (ftex > 0) {
+                u32 ftw, fth; tex_dims(r, ftex, &ftw, &fth);
+                for (u32 li = 0; li < lcnt; li++) {
+                    dbg_floors++;
+                    if (is_scroll && scroll_count < INF_MAX_ELEVS) {
+                        mb_init(&scroll_mb[scroll_count], ftex);
+                        scroll_si[scroll_count] = si;
+                        build_floor_poly(&scroll_mb[scroll_count],
+                                         &traced[loff[li]], lsz[li],
+                                         sec->floor_y, sec->floor_offset.u, sec->floor_offset.v,
+                                         true, ambient, sec, true, ftw, fth);
+                        scroll_count++;
+                    } else {
+                        build_floor_poly(&builders[ftex],
+                                         &traced[loff[li]], lsz[li],
+                                         sec->floor_y, sec->floor_offset.u, sec->floor_offset.v,
+                                         true, ambient, sec, true, ftw, fth);
+                    }
+                }
+            }
+
+            /* Render ceiling for EVERY loop.
+             * Ghidra RE: bit 1 (0x02) = NO_CEIL (skip ceiling), not bit 0. */
+            if (!(sec->flags & LVT_SEC_FLAG_NO_CEIL)) {
+                u32 ctex = resolve_tex(r, level, sec->ceil_tex);
+                if (ctex > 0) {
+                    u32 ctw, cth; tex_dims(r, ctex, &ctw, &cth);
+                    for (u32 li = 0; li < lcnt; li++) {
+                        build_floor_poly(&builders[ctex],
+                                         &traced[loff[li]], lsz[li],
+                                         sec->ceil_y, sec->ceil_offset.u, sec->ceil_offset.v,
+                                         false, ambient, sec, false, ctw, cth);
+                    }
+                }
+            }
+        }
+
+        /* Walls */
+        for (u32 wi = 0; wi < sec->wall_count; wi++) {
+            const LvtWall *wall = &sec->walls[wi];
+            if (wall->v1 < 0 || wall->v1 >= (i32)sec->vertex_count ||
+                wall->v2 < 0 || wall->v2 >= (i32)sec->vertex_count) continue;
+
+            f32 x0 = sec->vertices[wall->v1].x;
+            f32 z0 = sec->vertices[wall->v1].y;
+            f32 x1 = sec->vertices[wall->v2].x;
+            f32 z1 = sec->vertices[wall->v2].y;
+
+            /* Sky-boundary walls: invisible portals that outline the sky volume */
+            if (wall->flags & LVT_WALL_FLAG_SKY_BOUNDARY) continue;
+
+            u32 mid_tex = resolve_tex(r, level, wall->mid.tex_id);
+            u32 top_tex = resolve_tex(r, level, wall->top.tex_id);
+            u32 bot_tex = resolve_tex(r, level, wall->bot.tex_id);
+
+            f32 wall_light = OL_CLAMP(ambient + wall->light / 31.0f, 0.0f, 1.0f);
+
+            if (wall->adjoin < 0) {
+                /* Skip degenerate zero-length walls */
+                f32 wdx = x1-x0, wdz = z1-z0;
+                if (wdx*wdx + wdz*wdz < 0.001f) continue;
+
+                /* Solid wall: LVT v_offset includes the sector's floor height.
+                 * The original engine (Ghidra RE) subtracts floor_y so that
+                 * textures tile seamlessly across sectors at different heights.
+                 * Example: BANK pillar (sec 603, floor=0, v=3.25) and upper
+                 * facade (sec 38, floor=7.5, v=10.80) both become v≈3.25
+                 * after adjustment, making the GWBANK01 texture align. */
+                if (mid_tex > 0 && mid_tex != default_pcx_tex) {
+                    u32 mw, mh; tex_dims(r, mid_tex, &mw, &mh);
+                    f32 v_adj = wall->mid.offset.v - sec->floor_y;
+                    build_wall_quad(&builders[mid_tex],
+                                    x0, z0, x1, z1,
+                                    sec->floor_y, sec->ceil_y,
+                                    wall->mid.offset.u, v_adj,
+                                    wall_light, wall->flags, mw, mh);
+                }
+            } else {
+                /* Portal wall: render TOP and BOT strips */
+                const LvtSector *adj = (wall->adjoin < (i32)level->sector_count)
+                                       ? &level->sectors[wall->adjoin] : NULL;
+                f32 adj_floor = adj ? adj->floor_y : sec->floor_y;
+                f32 adj_ceil  = adj ? adj->ceil_y  : sec->ceil_y;
+
+                if (wall->flags & LVT_WALL_FLAG_ADJOIN_MID) {
+                    /* ADJOIN_MID with DADJOIN: 3-sector portal (arch/passthrough).
+                     * The area between sec_floor and adj_floor is the PASSAGEWAY.
+                     * Don't render BOT strip — it would block the walkway.
+                     * Only render TOP strip (arch top texture).
+                     *
+                     * ADJOIN_MID without DADJOIN: 2-sector portal (window/fence).
+                     * Render both TOP and BOT strips (solid wall around window). */
+                    bool is_passthrough = (wall->dadjoin >= 0);
+
+                    /* TOP strip: v_adj = v - adj_ceil (strip bottom) */
+                    if (adj_ceil < sec->ceil_y && top_tex > 0 && top_tex != default_pcx_tex) {
+                        u32 tw, th; tex_dims(r, top_tex, &tw, &th);
+                        f32 tv_adj = wall->top.offset.v - adj_ceil;
+                        build_wall_quad(&builders[top_tex], x0, z0, x1, z1,
+                                        adj_ceil, sec->ceil_y,
+                                        wall->top.offset.u, tv_adj,
+                                        wall_light, wall->flags, tw, th);
+                    }
+                    /* BOT strip — skip for passthrough (arch) */
+                    if (!is_passthrough && adj_floor > sec->floor_y &&
+                        bot_tex > 0 && bot_tex != default_pcx_tex) {
+                        u32 tw, th; tex_dims(r, bot_tex, &tw, &th);
+                        f32 tv_adj = wall->bot.offset.v - sec->floor_y;
+                        build_wall_quad(&builders[bot_tex], x0, z0, x1, z1,
+                                        sec->floor_y, adj_floor,
+                                        wall->bot.offset.u, tv_adj,
+                                        wall_light, wall->flags, tw, th);
+                    }
+                    /* MID texture as transparent overlay in the OPENING.
+                     * TFE RE: WF1_ADJ_MID_TEX (flag bit 0) controls whether
+                     * the MID texture renders on portal walls. In Outlaws LVT,
+                     * flag 0x2000 = ADJOIN_MID (portal type), but the MID
+                     * overlay only renders if flag bit 0 (0x01) is ALSO set.
+                     * Without bit 0, the MID is used for collision only.
+                     * Example: BANK windows have flags=0xa800 (no bit 0) →
+                     * NO MID overlay. Bars are visible as solid walls inside
+                     * the window recess sector behind the portal. */
+                    if (!is_passthrough && (wall->flags & 0x01u) && !wall->window_broken &&
+                        mid_tex > 0 && mid_tex != default_pcx_tex) {
+                        u32 mw, mh; tex_dims(r, mid_tex, &mw, &mh);
+                        f32 open_bot = adj_floor > sec->floor_y ? adj_floor : sec->floor_y;
+                        f32 open_top = adj_ceil  < sec->ceil_y  ? adj_ceil  : sec->ceil_y;
+                        if (open_top > open_bot) {
+                            f32 tv_adj = wall->mid.offset.v - open_bot;
+                            build_wall_quad(&builders[mid_tex], x0, z0, x1, z1,
+                                            open_bot, open_top,
+                                            wall->mid.offset.u, tv_adj,
+                                            wall_light, wall->flags, mw, mh);
+                        }
+                    }
+                } else if (wall->dadjoin >= 0 &&
+                           wall->dadjoin < (i32)level->sector_count) {
+                    /* DADJOIN portal: 3-sector vertical split.
+                     * Ghidra RE of Wall_ComputeOpenings: the wall has TWO
+                     * portal openings and up to 3 solid strips:
+                     *   TOP:  adj_ceil  → sec_ceil   (above upper portal)
+                     *   MID:  dadj_ceil → adj_floor   (between the two portals)
+                     *   BOT:  sec_floor → dadj_floor  (below lower portal)
+                     * Upper opening: adj_floor → adj_ceil  (into adjoin sector)
+                     * Lower opening: dadj_floor → dadj_ceil (into dadjoin sector)
+                     *
+                     * BANK example: sec 603 (floor=0,ceil=24) → adj 38 (floor=7.5)
+                     *   + dadj 44 (floor=0,ceil=3.5)
+                     *   Lower opening: 0→3.5 (into sec 44, ground level)
+                     *   MID strip: 3.5→7.5 (door frame, MID texture)
+                     *   Upper opening: 7.5→24 (into sec 38, upper level) */
+                    const LvtSector *dadj = &level->sectors[wall->dadjoin];
+                    f32 dadj_floor = dadj->floor_y;
+                    f32 dadj_ceil  = dadj->ceil_y;
+
+                    /* TOP strip: v_adj = v - adj_ceil (strip bottom) */
+                    if (adj_ceil < sec->ceil_y && top_tex > 0 && top_tex != default_pcx_tex) {
+                        u32 tw, th; tex_dims(r, top_tex, &tw, &th);
+                        f32 tv_adj = wall->top.offset.v - adj_ceil;
+                        build_wall_quad(&builders[top_tex], x0, z0, x1, z1,
+                                        adj_ceil, sec->ceil_y,
+                                        wall->top.offset.u, tv_adj,
+                                        wall_light, wall->flags, tw, th);
+                    }
+                    /* MID strip: v_adj = v - dadj_ceil (strip bottom) */
+                    if (dadj_ceil < adj_floor && mid_tex > 0 && mid_tex != default_pcx_tex) {
+                        u32 mw, mh; tex_dims(r, mid_tex, &mw, &mh);
+                        f32 tv_adj = wall->mid.offset.v - dadj_ceil;
+                        build_wall_quad(&builders[mid_tex], x0, z0, x1, z1,
+                                        dadj_ceil, adj_floor,
+                                        wall->mid.offset.u, tv_adj,
+                                        wall_light, wall->flags, mw, mh);
+                    }
+                    /* BOT strip: v_adj = v - sec_floor (strip bottom) */
+                    if (dadj_floor > sec->floor_y) {
+                        u32 t; f32 tu, tv;
+                        if (bot_tex > 0 && bot_tex != default_pcx_tex) {
+                            t = bot_tex; tu = wall->bot.offset.u;
+                            tv = wall->bot.offset.v - sec->floor_y;
+                        } else if (mid_tex > 0 && mid_tex != default_pcx_tex) {
+                            t = mid_tex; tu = wall->mid.offset.u;
+                            tv = wall->mid.offset.v - sec->floor_y;
+                        } else { t = 0; tu = tv = 0; }
+                        if (t > 0) {
+                            u32 tw, th; tex_dims(r, t, &tw, &th);
+                            build_wall_quad(&builders[t], x0, z0, x1, z1,
+                                            sec->floor_y, dadj_floor,
+                                            tu, tv,
+                                            wall_light, wall->flags, tw, th);
+                        }
+                    }
+                } else {
+                    /* Regular portal (no DADJOIN): TOP/BOT strips */
+                    bool has_top = (adj_ceil < sec->ceil_y);
+                    bool has_bot = (adj_floor > sec->floor_y);
+
+                    /* Swinging door panels.
+                     * A MORPH door leaf sector (e.g. HOTELDOOR01) sits at the top
+                     * of the doorway (its floor is ABOVE the room floor); the
+                     * visible door leaf is the BOT "apron" hanging from the leaf
+                     * floor down to the room floor. It must be drawn from the LEAF
+                     * (moving vertices) so it swings; and the same panel drawn
+                     * from the static neighbour side must be skipped, else a fixed
+                     * copy hides the animation. */
+                    bool this_is_door = inf && inf_is_morph_door(inf, si);
+                    bool adj_is_door  = inf && wall->adjoin >= 0 &&
+                                        inf_is_morph_door(inf, (u32)wall->adjoin);
+                    if (adj_is_door) {
+                        /* Neighbour side of a door: the leaf draws its own panel. */
+                        has_bot = false;
+                    }
+                    if (this_is_door && adj_floor < sec->floor_y) {
+                        /* Draw the leaf apron from the room floor up to the leaf
+                         * floor, using this (moving) sector's vertices. */
+                        u32 t; f32 tu, tv;
+                        if (bot_tex > 0 && bot_tex != default_pcx_tex) {
+                            t = bot_tex; tu = wall->bot.offset.u;
+                            tv = wall->bot.offset.v - adj_floor;
+                        } else if (mid_tex > 0 && mid_tex != default_pcx_tex) {
+                            t = mid_tex; tu = wall->mid.offset.u;
+                            tv = wall->mid.offset.v - adj_floor;
+                        } else { t = 0; tu = tv = 0; }
+                        if (t > 0) {
+                            u32 tw, th; tex_dims(r, t, &tw, &th);
+                            build_wall_quad(&builders[t], x0, z0, x1, z1,
+                                            adj_floor, sec->floor_y,
+                                            tu, tv, wall_light, wall->flags, tw, th);
+                        }
+                    }
+
+                    /* TOP strip: v_adj = v - adj_ceil (strip bottom) */
+                    if (has_top) {
+                        u32 t = (top_tex > 0 && top_tex != default_pcx_tex) ? top_tex : 0;
+                        if (t > 0) {
+                            u32 tw, th; tex_dims(r, t, &tw, &th);
+                            f32 tv_adj = wall->top.offset.v - adj_ceil;
+                            build_wall_quad(&builders[t], x0, z0, x1, z1,
+                                            adj_ceil, sec->ceil_y,
+                                            wall->top.offset.u, tv_adj,
+                                            wall_light, wall->flags, tw, th);
+                        }
+                    }
+                    /* BOT strip: v_adj = v - sec_floor (strip bottom) */
+                    if (has_bot) {
+                        u32 t; f32 tu, tv;
+                        if (bot_tex > 0 && bot_tex != default_pcx_tex) {
+                            t = bot_tex; tu = wall->bot.offset.u;
+                            tv = wall->bot.offset.v - sec->floor_y;
+                        } else if (mid_tex > 0 && mid_tex != default_pcx_tex) {
+                            t = mid_tex; tu = wall->mid.offset.u;
+                            tv = wall->mid.offset.v - sec->floor_y;
+                        } else { t = 0; tu = tv = 0; }
+                        if (t > 0) {
+                            u32 tw, th; tex_dims(r, t, &tw, &th);
+                            build_wall_quad(&builders[t], x0, z0, x1, z1,
+                                            sec->floor_y, adj_floor,
+                                            tu, tv,
+                                            wall_light, wall->flags, tw, th);
+                        }
+                    }
+                    /* MID mask overlay in the portal opening: glass windows,
+                     * fences, grilles. Wall flag bit 0 (0x01 = "render MID
+                     * texture on this portal") marks a mask wall. Outlaws glass
+                     * windows use GW*WIN.ATX animated textures on regular portal
+                     * walls with bit 0 set (but NOT the ADJOIN_MID 0x2000 flag),
+                     * so they must render here, not only in the ADJOIN_MID case.
+                     * A window that has been shot out (shattered) is skipped. */
+                    if ((wall->flags & 0x01u) && !wall->window_broken &&
+                        mid_tex > 0 && mid_tex != default_pcx_tex) {
+                        f32 open_bot = adj_floor > sec->floor_y ? adj_floor : sec->floor_y;
+                        f32 open_top = adj_ceil  < sec->ceil_y  ? adj_ceil  : sec->ceil_y;
+                        if (open_top > open_bot) {
+                            u32 mw, mh; tex_dims(r, mid_tex, &mw, &mh);
+                            f32 tv_adj = wall->mid.offset.v - open_bot;
+                            build_wall_quad(&builders[mid_tex], x0, z0, x1, z1,
+                                            open_bot, open_top,
+                                            wall->mid.offset.u, tv_adj,
+                                            wall_light, wall->flags, mw, mh);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /* Count non-empty builders and upload */
+    u32 mesh_count = 0;
+    for (u32 i = 0; i <= r->texture_count; i++)
+        if (builders[i].vert_count > 0) mesh_count++;
+    mesh_count += scroll_count;
+
+    r->level_meshes = calloc(mesh_count, sizeof(RenderMesh));
+    if (!r->level_meshes) { free(builders); return false; }
+    r->level_mesh_count = 0;
+
+    u32 dbg_total_verts = 0, dbg_total_idx = 0;
+    for (u32 i = 0; i <= r->texture_count; i++) {
+        if (builders[i].vert_count > 0) {
+            dbg_total_verts += builders[i].vert_count;
+            dbg_total_idx += builders[i].idx_count;
+            RenderMesh m = mb_upload(&builders[i]);
+            m.sector_idx = 0xFFFFFFFF;
+            m.is_scroll_floor = false;
+            r->level_meshes[r->level_mesh_count++] = m;
+        }
+    }
+    OL_LOG("Level mesh totals: %u verts, %u indices (%u tris)\n",
+           dbg_total_verts, dbg_total_idx, dbg_total_idx / 3);
+
+    /* Upload dedicated scroll-floor sector meshes */
+    for (u32 i = 0; i < scroll_count; i++) {
+        RenderMesh m = mb_upload(&scroll_mb[i]);
+        m.sector_idx = scroll_si[i];
+        m.is_scroll_floor = true;
+        r->level_meshes[r->level_mesh_count++] = m;
+    }
+
+    free(builders);
+    OL_LOG("Level geom: %u floors built\n", dbg_floors);
+    OL_LOG("Level built: %u draw calls (%u scroll floors)\n",
+           r->level_mesh_count, scroll_count);
+    return true;
+}
+
+/* -------------------------------------------------------------------------
+ * Camera and rendering
+ * ---------------------------------------------------------------------- */
+
+void renderer_set_camera(Renderer *r, Vec3 pos, f32 yaw, f32 pitch) {
+    f32 cp = cosf(pitch), sp = sinf(pitch);
+    f32 cy = cosf(yaw),   sy = sinf(yaw);
+    Vec3 forward = { cy * cp, sp, -sy * cp };
+    Vec3 center  = vec3_add(pos, forward);
+    Vec3 up      = { 0, 1, 0 };
+    r->view = mat4_look_at(pos, center, up);
+
+    /* Extract right/up for billboard rendering (column-major: m[col][row]) */
+    r->cam_right = (Vec3){ r->view.m[0][0], r->view.m[1][0], r->view.m[2][0] };
+    r->cam_up    = (Vec3){ r->view.m[0][1], r->view.m[1][1], r->view.m[2][1] };
+
+    /* Cache for sky rendering */
+    r->cam_yaw   = yaw;
+    r->cam_pitch = pitch;
+}
+
+void renderer_draw_level(Renderer *r) {
+    if (!r->level_meshes) return;
+
+    glUseProgram(r->prog_world);
+
+    /* Disable backface culling for level geometry.  The Jedi Engine is a
+     * portal renderer that only draws walls visible from the correct side;
+     * our GL renderer draws ALL geometry, and some wall quads have winding
+     * that faces away from the sector interior.  Disabling culling ensures
+     * no walls become invisible. */
+    glDisable(GL_CULL_FACE);
+
+    /* Enable alpha blending so transparent textures (window bars, fences)
+     * render correctly. The shader discards alpha < 0.1 for hard cutoff,
+     * and blending handles the remaining alpha compositing. */
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    /* MVP uniform */
+    Mat4 mvp = mat4_mul(r->proj, r->view);
+    GLint mvp_loc = glGetUniformLocation(r->prog_world, "uMVP");
+    glUniformMatrix4fv(mvp_loc, 1, GL_FALSE, &mvp.m[0][0]);
+
+    GLint tex_loc   = glGetUniformLocation(r->prog_world, "uTex");
+    GLint amb_loc   = glGetUniformLocation(r->prog_world, "uAmbient");
+    GLint uvoff_loc = glGetUniformLocation(r->prog_world, "uUVOffset");
+    glUniform1f(amb_loc, 0.1f); /* Minimum ambient */
+    glUniform2f(uvoff_loc, 0.0f, 0.0f); /* Default: no scroll */
+
+    for (u32 i = 0; i < r->level_mesh_count; i++) {
+        const RenderMesh *mesh = &r->level_meshes[i];
+        if (!mesh->vao || !mesh->index_count) continue;
+
+        /* Bind texture — skip meshes with no valid texture (tex_id 0 = none) */
+        if (mesh->tex_id == 0) continue;
+        glActiveTexture(GL_TEXTURE0);
+        if (mesh->tex_id > 0 && mesh->tex_id <= r->texture_count) {
+            glBindTexture(GL_TEXTURE_2D, r->textures[mesh->tex_id - 1].handle);
+        } else {
+            glBindTexture(GL_TEXTURE_2D, r->missing_tex);
+        }
+        glUniform1i(tex_loc, 0);
+
+        /* Apply UV scroll offset for scroll-floor sector meshes */
+        if (mesh->is_scroll_floor && mesh->sector_idx < 4096) {
+            glUniform2f(uvoff_loc,
+                        r->sector_scroll_u[mesh->sector_idx],
+                        r->sector_scroll_v[mesh->sector_idx]);
+        } else {
+            glUniform2f(uvoff_loc, 0.0f, 0.0f);
+        }
+
+        glBindVertexArray(mesh->vao);
+        glDrawElements(GL_TRIANGLES, (GLsizei)mesh->index_count, GL_UNSIGNED_INT, 0);
+    }
+    glBindVertexArray(0);
+    /* (polygon offset was disabled above) */
+    glDisable(GL_BLEND);
+    glEnable(GL_CULL_FACE); /* Re-enable for sprites/HUD */
+    glUseProgram(0);
+}
+
+void renderer_sync_scroll(Renderer *r, const InfSystem *inf) {
+    if (!inf) return;
+    for (u32 i = 0; i < inf->count; i++) {
+        const Elevator *el = &inf->elevs[i];
+        if (!el->active) continue;
+        if (el->type != ELEV_TYPE_SCROLL_FLOOR) continue;
+        if (el->sector_idx >= 4096) continue;
+        r->sector_scroll_u[el->sector_idx] = el->scroll_u;
+        r->sector_scroll_v[el->sector_idx] = el->scroll_v;
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * Sky panorama rendering
+ *
+ * Renders the sky as a screen-space textured background quad before world
+ * geometry (depth writes disabled). UV u scrolls with camera yaw; v maps
+ * camera pitch. The panorama wraps at u=1.
+ * ---------------------------------------------------------------------- */
+
+void renderer_set_sky(Renderer *r, u32 sky_tex, f32 parallax_x) {
+    r->sky_tex        = sky_tex;
+    r->sky_parallax_x = (parallax_x > 0.0f) ? parallax_x : 1024.0f;
+}
+
+void renderer_draw_sky(Renderer *r) {
+    if (!r->sky_tex || !r->prog_hud || !r->hud_vao) return;
+    if (r->sky_tex > r->texture_count) return;
+
+    f32 W = (f32)r->cfg.width;
+    f32 H = (f32)r->cfg.height;
+    Mat4 ortho = mat4_ortho(0, W, H, 0, -1, 1);
+
+    /*
+     * UV calculation for panoramic sky:
+     *   Horizontal (u): yaw maps 0..2π to 0..1 (one full panorama wrap).
+     *   The fraction of the panorama visible at the current FOV:
+     *     horiz_frac = horizontal_fov / (2π)
+     *   u at left edge  = yaw/(2π) - horiz_frac/2
+     *   u at right edge = yaw/(2π) + horiz_frac/2
+     *
+     *   Vertical (v): pitch maps pitch_limit..−pitch_limit to 0..1.
+     *     v = 0.5 - pitch / (vertical_fov)
+     *   We show a vertical band matching the vertical FOV.
+     */
+    f32 aspect     = (f32)r->cfg.width / (f32)r->cfg.height;
+    f32 hfov       = 2.0f * atanf(tanf(r->cam_fov_rad * 0.5f) * aspect);
+    f32 horiz_frac = hfov / (2.0f * OL_PI);
+    f32 yaw_frac   = r->cam_yaw / (2.0f * OL_PI);
+
+    /* Negate because increasing yaw (left-turn) should shift sky right */
+    f32 u0 = -yaw_frac - horiz_frac * 0.5f;
+    f32 u1 = -yaw_frac + horiz_frac * 0.5f;
+
+    /* Vertical: pitch 0 = horizon (v=0.5), pitch up = v decreases */
+    f32 vert_frac = r->cam_fov_rad / (2.0f * OL_PI);
+    f32 v_center  = 0.5f - r->cam_pitch / (2.0f * OL_PI);
+    f32 v0        = v_center - vert_frac * 0.5f;
+    f32 v1        = v_center + vert_frac * 0.5f;
+
+    /* 6 vertices (2 triangles), format: x,y, u,v, r,g,b,a (8 floats each) */
+    f32 verts[6 * 8] = {
+        0,0, u0,v0, 1,1,1,1,  W,0, u1,v0, 1,1,1,1,  W,H, u1,v1, 1,1,1,1,
+        0,0, u0,v0, 1,1,1,1,  W,H, u1,v1, 1,1,1,1,  0,H, u0,v1, 1,1,1,1,
+    };
+
+    glUseProgram(r->prog_hud);
+    GLint ortho_loc  = glGetUniformLocation(r->prog_hud, "uOrtho");
+    GLint hastex_loc = glGetUniformLocation(r->prog_hud, "uHasTex");
+    GLint tex_loc    = glGetUniformLocation(r->prog_hud, "uTex");
+    glUniformMatrix4fv(ortho_loc, 1, GL_FALSE, &ortho.m[0][0]);
+    glUniform1i(hastex_loc, 1);
+    glUniform1i(tex_loc, 0);
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glDepthMask(GL_FALSE);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, r->textures[r->sky_tex - 1].handle);
+    /* Enable horizontal wrapping so the panorama repeats seamlessly */
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    glBindVertexArray(r->hud_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, r->hud_vbo);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+
+    glDepthMask(GL_TRUE);
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_CULL_FACE);
+    glBindVertexArray(0);
+    glUseProgram(0);
+}
+
+/* -------------------------------------------------------------------------
+ * Sprite billboard rendering
+ *
+ * Per-sprite vertex layout: x,y,z, u,v, r,g,b,a  (9 floats)
+ * Each sprite = 6 vertices (two triangles, no index buffer).
+ * ---------------------------------------------------------------------- */
+#define SPRITE_STRIDE 9  /* floats per vertex */
+#define SPRITE_VERTS  6  /* vertices per sprite (2 triangles) */
+
+void renderer_draw_sprites(Renderer *r, const EntityList *entities) {
+    if (!r->prog_sprite || !r->sprite_vao || !entities) return;
+
+    static f32 vbuf[2048 * SPRITE_VERTS * SPRITE_STRIDE];
+    u32 nv = 0;
+
+    Vec3 cr  = r->cam_right;
+    Vec3 cu  = r->cam_up;
+    Mat4 mvp = mat4_mul(r->proj, r->view);
+
+    /* Camera forward vector (into the scene, GL space: -Z) */
+    Vec3 cam_fwd = {
+        -(r->view.m[0][2]),
+        -(r->view.m[1][2]),
+        -(r->view.m[2][2])
+    };
+
+    glUseProgram(r->prog_sprite);
+    GLint mvp_loc    = glGetUniformLocation(r->prog_sprite, "uMVP");
+    GLint tex_loc    = glGetUniformLocation(r->prog_sprite, "uTex");
+    GLint hastex_loc = glGetUniformLocation(r->prog_sprite, "uHasTex");
+    glUniformMatrix4fv(mvp_loc, 1, GL_FALSE, &mvp.m[0][0]);
+    glUniform1i(tex_loc, 0);
+    glBindVertexArray(r->sprite_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, r->sprite_vbo);
+
+    for (u32 i = 0; i < entities->count; i++) {
+        const Entity *e = &entities->entities[i];
+        if (!e->active || e->kind == ENTITY_TRIGGER) continue;
+        /* Skip invisible: no sprite dimensions in entity def or NWX */
+        if (e->sprite_w == 0.0f && e->sprite_h == 0.0f &&
+            e->render_w == 0.0f && e->render_h == 0.0f) continue;
+        if (nv + SPRITE_VERTS > 2048 * SPRITE_VERTS) break;
+
+        /* Use NWX-derived render dimensions when available, else entity def */
+        f32 rw = (e->render_w > 0) ? e->render_w : e->sprite_w;
+        f32 rh = (e->render_h > 0) ? e->render_h : e->sprite_h;
+        f32 hw = rw * 0.5f;
+        f32 h  = rh;
+
+        /* Convert LVT position to GL space (negate Z) */
+        Vec3 base = { e->pos.x, e->pos.y, -e->pos.z };
+
+        /* No color tint — sprites render at their authored colors.
+         * (Enemy state was previously debug-tinted red/pink; removed.) */
+        f32 tr=1,tg=1,tb=1,ta=1;
+
+        /*
+         * 8-directional sprite selection.
+         * dir=0: player sees enemy front (enemy faces player).
+         * dir=4: player sees enemy back.  dir=2/6: side views.
+         *
+         * The entity-to-camera direction = -cam_fwd (camera looks INTO scene,
+         * so entity→camera is the opposite direction).
+         * In LVT space: entity→cam = (-cam_fwd.x, cam_fwd.z).
+         */
+        u32 dir = 0;
+        {
+            /* Entity-to-camera direction in LVT space */
+            f32 dx = -cam_fwd.x;
+            f32 dz =  cam_fwd.z;   /* cam_fwd.z is already GL -Z; negate → LVT +Z */
+            f32 ey = e->yaw;       /* entity facing direction (LVT yaw in radians) */
+            /* Relative angle: 0 when entity faces the camera (front view) */
+            f32 rel = atan2f(dz, dx) - ey;
+            /* Normalize to [0, 2π) */
+            while (rel <  0.0f)        rel += 2.0f * OL_PI;
+            while (rel >= 2.0f*OL_PI) rel -= 2.0f * OL_PI;
+            /* Map to 0-7 (each slice = π/4 = 45°) */
+            dir = (u32)(rel / (OL_PI / 4.0f) + 0.5f) % 8;
+        }
+
+        /* Select texture: per-AI-state animation, cyclic decoration anim,
+         * or per-direction sprite_dir_tex[]. */
+        u32 tex_id;
+        if (e->has_anim_seqs && e->anim_seqs[e->cur_anim].frame_count > 0) {
+            /* Enemy with per-AI-state animation sequences */
+            const EntityAnimSeq *seq = &e->anim_seqs[e->cur_anim];
+            u32 frame = e->cur_anim_frame;
+            if (frame >= seq->frame_count) frame = seq->frame_count - 1;
+            tex_id = seq->dir_frames[dir][frame];
+            /* Size the billboard to the CURRENT frame's cell (a lying corpse
+             * cell is wide and short, a standing pose tall) instead of the idle
+             * size — otherwise the corpse gets stretched into a tall smear. */
+            if (tex_id && seq->fh[dir][frame] > 0.0f) {
+                rw = seq->fw[dir][frame];
+                rh = seq->fh[dir][frame];
+                hw = rw * 0.5f;
+                h  = rh;
+            }
+            if (!tex_id) tex_id = e->sprite_dir_tex[dir];
+            if (!tex_id) tex_id = e->sprite_tex;
+        } else if (e->anim_count > 1 && e->anim_frame < e->anim_count && e->anim_tex[e->anim_frame]) {
+            tex_id = e->anim_tex[e->anim_frame];
+        } else {
+            tex_id = e->sprite_dir_tex[dir];
+            if (!tex_id) tex_id = e->sprite_tex; /* fallback to primary */
+        }
+
+        /* Skip entities with no texture — no NWX sprite loaded.
+         * Don't render large placeholder quads for model-only entities. */
+        if (!tex_id) continue;
+
+        /* Flat (ground-lying) sprites: horizontal quad at floor level.
+         * X axis = world right (+X), Z axis = world forward (-Z in GL = +Z in LVT).
+         * sprite_w = width, sprite_h = depth on the floor. */
+        Vec3 bl, br, tr_, tl_;
+        if (e->flat) {
+            f32 hd = rh * 0.5f; /* half-depth along Z */
+            bl  = (Vec3){ base.x - hw, base.y, base.z - hd };
+            br  = (Vec3){ base.x + hw, base.y, base.z - hd };
+            tr_ = (Vec3){ base.x + hw, base.y, base.z + hd };
+            tl_ = (Vec3){ base.x - hw, base.y, base.z + hd };
+        } else {
+            /* Billboard corners: bottom-left, bottom-right, top-right, top-left */
+            bl  = vec3_sub(base, vec3_scale(cr, hw));
+            br  = vec3_add(base, vec3_scale(cr, hw));
+            tr_ = vec3_add(vec3_add(base, vec3_scale(cr, hw)), vec3_scale(cu, h));
+            tl_ = vec3_add(vec3_sub(base, vec3_scale(cr, hw)), vec3_scale(cu, h));
+        }
+
+#define PUSH_V(vx,vy,vz,uu,vv) \
+    vbuf[nv*SPRITE_STRIDE+0]=(vx); vbuf[nv*SPRITE_STRIDE+1]=(vy); vbuf[nv*SPRITE_STRIDE+2]=(vz); \
+    vbuf[nv*SPRITE_STRIDE+3]=(uu); vbuf[nv*SPRITE_STRIDE+4]=(vv); \
+    vbuf[nv*SPRITE_STRIDE+5]=tr;   vbuf[nv*SPRITE_STRIDE+6]=tg; \
+    vbuf[nv*SPRITE_STRIDE+7]=tb;   vbuf[nv*SPRITE_STRIDE+8]=ta; nv++
+
+        PUSH_V(bl.x,bl.y,bl.z,   0,0);
+        PUSH_V(br.x,br.y,br.z,   1,0);
+        PUSH_V(tr_.x,tr_.y,tr_.z, 1,1);
+        PUSH_V(bl.x,bl.y,bl.z,   0,0);
+        PUSH_V(tr_.x,tr_.y,tr_.z, 1,1);
+        PUSH_V(tl_.x,tl_.y,tl_.z, 0,1);
+#undef PUSH_V
+
+        /* Upload and draw this sprite */
+        glBufferSubData(GL_ARRAY_BUFFER, 0, nv * SPRITE_STRIDE * sizeof(f32), vbuf);
+
+        GLuint tex_handle;
+        bool   has_tex;
+        if (tex_id > 0 && tex_id <= r->texture_count) {
+            tex_handle = r->textures[tex_id - 1].handle;
+            has_tex    = true;
+        } else {
+            tex_handle = r->missing_tex;
+            has_tex    = false;
+        }
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, tex_handle);
+        glUniform1i(hastex_loc, has_tex ? 1 : 0);
+        glDrawArrays(GL_TRIANGLES, (GLint)(nv - SPRITE_VERTS), SPRITE_VERTS);
+        nv = 0;
+    }
+
+    glBindVertexArray(0);
+    glUseProgram(0);
+}
+
+/* -------------------------------------------------------------------------
+ * HUD rendering (2D orthographic overlay)
+ *
+ * Per-vertex: x,y, u,v, r,g,b,a  (8 floats)
+ * ---------------------------------------------------------------------- */
+#define HUD_STRIDE 8
+
+static void hud_quad(f32 *buf, u32 *n,
+                     f32 x0, f32 y0, f32 x1, f32 y1,
+                     f32 u0, f32 v0, f32 u1, f32 v1,
+                     f32 r, f32 g, f32 b, f32 a) {
+    /* Two triangles from rect */
+    f32 verts[6][HUD_STRIDE] = {
+        {x0,y0,u0,v0,r,g,b,a}, {x1,y0,u1,v0,r,g,b,a}, {x1,y1,u1,v1,r,g,b,a},
+        {x0,y0,u0,v0,r,g,b,a}, {x1,y1,u1,v1,r,g,b,a}, {x0,y1,u0,v1,r,g,b,a},
+    };
+    for (int i = 0; i < 6; i++) {
+        for (int j = 0; j < HUD_STRIDE; j++)
+            buf[(*n)*HUD_STRIDE + j] = verts[i][j];
+        (*n)++;
+    }
+}
+
+/* Thick 2D line (rotated quad) for the automap. */
+static void hud_line(f32 *buf, u32 *n, f32 x0, f32 y0, f32 x1, f32 y1,
+                     f32 t, f32 r, f32 g, f32 b, f32 a) {
+    f32 dx = x1 - x0, dy = y1 - y0, len = sqrtf(dx*dx + dy*dy);
+    if (len < 1e-3f) return;
+    f32 nx = -dy / len * t * 0.5f, ny = dx / len * t * 0.5f;
+    f32 v[6][HUD_STRIDE] = {
+        {x0+nx,y0+ny,0,0,r,g,b,a}, {x1+nx,y1+ny,0,0,r,g,b,a}, {x1-nx,y1-ny,0,0,r,g,b,a},
+        {x0+nx,y0+ny,0,0,r,g,b,a}, {x1-nx,y1-ny,0,0,r,g,b,a}, {x0-nx,y0-ny,0,0,r,g,b,a},
+    };
+    for (int i = 0; i < 6; i++) {
+        for (int j = 0; j < HUD_STRIDE; j++) buf[(*n)*HUD_STRIDE+j] = v[i][j];
+        (*n)++;
+    }
+}
+
+/*
+ * Automap overlay (TAB). Player-oriented (the player faces "up" and the map
+ * rotates around them), centered on the player, drawn over the 3D view like the
+ * original's "mapoverlay maporiented" mode. Walls are coloured by kind: solid
+ * walls bright, portals/adjoins dim, breakable windows cyan; the player is a
+ * white arrow at the centre.
+ */
+void renderer_draw_minimap(Renderer *r, const LvtLevel *level,
+                           const InfSystem *inf, Vec3 ppos, f32 pyaw) {
+    if (!r->prog_hud || !r->hud_vao || !level) return;
+    f32 W = (f32)r->cfg.width, H = (f32)r->cfg.height;
+    Mat4 ortho = mat4_ortho(0, W, H, 0, -1, 1);
+
+    /* Must fit the shared hud_vbo (allocated for 1024*6 verts). */
+    static f32 vbuf[1024 * 6 * HUD_STRIDE];
+    u32 nv = 0;
+
+    glUseProgram(r->prog_hud);
+    GLint ortho_loc  = glGetUniformLocation(r->prog_hud, "uOrtho");
+    GLint hastex_loc = glGetUniformLocation(r->prog_hud, "uHasTex");
+    glUniformMatrix4fv(ortho_loc, 1, GL_FALSE, &ortho.m[0][0]);
+    glUniform1i(hastex_loc, 0);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glBindVertexArray(r->hud_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, r->hud_vbo);
+
+    #define MM_FLUSH() do { if (nv > 0) { \
+        glBufferSubData(GL_ARRAY_BUFFER, 0, nv*HUD_STRIDE*sizeof(f32), vbuf); \
+        glDrawArrays(GL_TRIANGLES, 0, (GLsizei)nv); nv = 0; } } while(0)
+
+    /* Dark backdrop so the wall lines read over the bright scene. */
+    hud_quad(vbuf, &nv, 0, 0, W, H, 0,0,0,0, 0.0f, 0.03f, 0.0f, 0.80f);
+    MM_FLUSH();
+
+    f32 cx = W * 0.5f, cy = H * 0.5f;
+    f32 scale = H / 380.0f;              /* world units shown vertically ≈ 380 */
+    f32 cf = cosf(pyaw), sf = sinf(pyaw);
+    f32 thick = OL_MAX(2.0f, H / 260.0f);
+
+    for (u32 si = 0; si < level->sector_count; si++) {
+        const LvtSector *sec = &level->sectors[si];
+        /* Is this sector a morph-door leaf? colour it yellow. */
+        bool is_door = inf && inf_is_morph_door(inf, si);
+        for (u32 wi = 0; wi < sec->wall_count; wi++) {
+            const LvtWall *w = &sec->walls[wi];
+            if (w->v1 < 0 || w->v2 < 0 ||
+                w->v1 >= (i32)sec->vertex_count || w->v2 >= (i32)sec->vertex_count) continue;
+            f32 ax = sec->vertices[w->v1].x - ppos.x, az = sec->vertices[w->v1].y - ppos.z;
+            f32 bx = sec->vertices[w->v2].x - ppos.x, bz = sec->vertices[w->v2].y - ppos.z;
+            /* player-oriented: forward → screen up, right → screen right */
+            f32 a_fwd = ax*cf + az*sf, a_rgt = ax*sf - az*cf;
+            f32 b_fwd = bx*cf + bz*sf, b_rgt = bx*sf - bz*cf;
+            f32 sx0 = cx + a_rgt*scale, sy0 = cy - a_fwd*scale;
+            f32 sx1 = cx + b_rgt*scale, sy1 = cy - b_fwd*scale;
+            /* cull segments fully outside the view */
+            if ((sx0 < 0 && sx1 < 0) || (sx0 > W && sx1 > W) ||
+                (sy0 < 0 && sy1 < 0) || (sy0 > H && sy1 > H)) continue;
+            f32 cr, cg, cb, ca = 1.0f;
+            if (w->is_window)      { cr=0.40f; cg=0.95f; cb=1.00f; }   /* window: cyan */
+            else if (is_door)      { cr=1.00f; cg=0.85f; cb=0.15f; }   /* door: yellow */
+            else if (w->adjoin < 0){ cr=0.35f; cg=1.00f; cb=0.35f; }   /* solid: bright green */
+            else                   { cr=0.35f; cg=0.55f; cb=0.40f; ca=0.85f; } /* portal: dim green */
+            hud_line(vbuf, &nv, sx0, sy0, sx1, sy1, thick, cr, cg, cb, ca);
+            if (nv + 6 > 1024*6) MM_FLUSH();
+        }
+    }
+    MM_FLUSH();
+
+    /* Player arrow (points up), white. */
+    f32 as = OL_MAX(6.0f, H / 90.0f);
+    hud_line(vbuf, &nv, cx, cy - as, cx - as*0.6f, cy + as*0.6f, thick*1.4f, 1,1,1,1);
+    hud_line(vbuf, &nv, cx, cy - as, cx + as*0.6f, cy + as*0.6f, thick*1.4f, 1,1,1,1);
+    hud_line(vbuf, &nv, cx - as*0.6f, cy + as*0.6f, cx + as*0.6f, cy + as*0.6f, thick*1.4f, 1,1,1,1);
+    MM_FLUSH();
+
+    #undef MM_FLUSH
+    glBindVertexArray(0);
+    glUseProgram(0);
+    glDisable(GL_BLEND);
+}
+
+/* --- Generic 2D helpers for menus (self-contained GL setup per call) --- */
+static void r2d_begin(Renderer *r, Mat4 *ortho) {
+    *ortho = mat4_ortho(0, (f32)r->cfg.width, (f32)r->cfg.height, 0, -1, 1);
+    glUseProgram(r->prog_hud);
+    glUniformMatrix4fv(glGetUniformLocation(r->prog_hud, "uOrtho"), 1, GL_FALSE, &ortho->m[0][0]);
+    glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE);
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glBindVertexArray(r->hud_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, r->hud_vbo);
+}
+
+/* Draw a textured image quad at (x,y) size (w,h). tex = renderer texture id. */
+void renderer_draw_image(Renderer *r, u32 tex, f32 x, f32 y, f32 w, f32 h,
+                         f32 tint, f32 alpha) {
+    if (!r->prog_hud || !r->hud_vao) return;
+    Mat4 ortho; r2d_begin(r, &ortho);
+    static f32 vb[6 * HUD_STRIDE]; u32 nv = 0;
+    hud_quad(vb, &nv, x, y, x+w, y+h, 0,0,1,1, tint, tint, tint, alpha);
+    glUniform1i(glGetUniformLocation(r->prog_hud, "uHasTex"), tex ? 1 : 0);
+    glUniform1i(glGetUniformLocation(r->prog_hud, "uTex"), 0);
+    glActiveTexture(GL_TEXTURE0);
+    if (tex && tex <= r->texture_count) glBindTexture(GL_TEXTURE_2D, r->textures[tex-1].handle);
+    else glBindTexture(GL_TEXTURE_2D, 0);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, nv*HUD_STRIDE*sizeof(f32), vb);
+    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)nv);
+    glBindVertexArray(0); glUseProgram(0); glDisable(GL_BLEND);
+}
+
+/* Textured quad with explicit UV sub-rect + colour tint (font atlases). */
+void renderer_draw_image_uv(Renderer *r, u32 tex, f32 x, f32 y, f32 w, f32 h,
+                            f32 u0, f32 v0, f32 u1, f32 v1,
+                            f32 cr, f32 cg, f32 cb, f32 ca) {
+    if (!r->prog_hud || !r->hud_vao) return;
+    Mat4 ortho; r2d_begin(r, &ortho);
+    static f32 vb[6 * HUD_STRIDE]; u32 nv = 0;
+    hud_quad(vb, &nv, x, y, x+w, y+h, u0, v0, u1, v1, cr, cg, cb, ca);
+    glUniform1i(glGetUniformLocation(r->prog_hud, "uHasTex"), tex ? 1 : 0);
+    glUniform1i(glGetUniformLocation(r->prog_hud, "uTex"), 0);
+    glActiveTexture(GL_TEXTURE0);
+    if (tex && tex <= r->texture_count) glBindTexture(GL_TEXTURE_2D, r->textures[tex-1].handle);
+    else glBindTexture(GL_TEXTURE_2D, 0);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, nv*HUD_STRIDE*sizeof(f32), vb);
+    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)nv);
+    glBindVertexArray(0); glUseProgram(0); glDisable(GL_BLEND);
+}
+
+/* Draw a solid colour rectangle (tex=0). */
+void renderer_draw_rect(Renderer *r, f32 x, f32 y, f32 w, f32 h,
+                        f32 cr, f32 cg, f32 cb, f32 ca) {
+    if (!r->prog_hud || !r->hud_vao) return;
+    Mat4 ortho; r2d_begin(r, &ortho);
+    static f32 vb[6 * HUD_STRIDE]; u32 nv = 0;
+    hud_quad(vb, &nv, x, y, x+w, y+h, 0,0,0,0, cr, cg, cb, ca);
+    glUniform1i(glGetUniformLocation(r->prog_hud, "uHasTex"), 0);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, 0);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, nv*HUD_STRIDE*sizeof(f32), vb);
+    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)nv);
+    glBindVertexArray(0); glUseProgram(0); glDisable(GL_BLEND);
+}
+
+/* Draw text via the embedded 5x7 font at (x,y), pixel-size px, with a shadow. */
+void renderer_draw_text(Renderer *r, const char *s, f32 x, f32 y, f32 px,
+                        f32 cr, f32 cg, f32 cb) {
+    if (!r->prog_hud || !r->hud_vao || !s) return;
+    Mat4 ortho; r2d_begin(r, &ortho);
+    static f32 vb[4096 * HUD_STRIDE]; u32 nv = 0;
+    glUniform1i(glGetUniformLocation(r->prog_hud, "uHasTex"), 0);
+    glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, 0);
+    f32 char_w = 6.0f * px;
+    for (int pass = 0; pass < 2; pass++) {
+        f32 ox = (pass==0) ? px : 0.0f, oy = (pass==0) ? px : 0.0f;
+        f32 pr = (pass==0) ? 0.0f : cr, pg = (pass==0) ? 0.0f : cg, pb = (pass==0) ? 0.0f : cb;
+        f32 cx = x;
+        for (int i = 0; s[i]; i++) {
+            if (s[i] == '\n') { cx = x; y += 9.0f*px; continue; }
+            int gi = font5x7_index(s[i]);
+            const unsigned char *gl = FONT5X7[gi];
+            for (int col = 0; col < 5; col++)
+                for (int row = 0; row < 7; row++) {
+                    if (!(gl[col] & (1 << row))) continue;
+                    f32 qx = cx + col*px + ox, qy = y + row*px + oy;
+                    if (nv + 6 <= 4096*6)
+                        hud_quad(vb, &nv, qx, qy, qx+px, qy+px, 0,0,0,0, pr,pg,pb,1.0f);
+                }
+            cx += char_w;
+        }
+    }
+    glBufferSubData(GL_ARRAY_BUFFER, 0, nv*HUD_STRIDE*sizeof(f32), vb);
+    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)nv);
+    glBindVertexArray(0); glUseProgram(0); glDisable(GL_BLEND);
+}
+
+void renderer_draw_hud(Renderer *r, const HudParams *hud) {
+    if (!r->prog_hud || !r->hud_vao) return;
+
+    f32 W = (f32)r->cfg.width;
+    f32 H = (f32)r->cfg.height;
+    Mat4 ortho = mat4_ortho(0, W, H, 0, -1, 1);
+
+    static f32 vbuf[1024 * 6 * HUD_STRIDE];
+    u32 nv = 0;
+
+    glUseProgram(r->prog_hud);
+    GLint ortho_loc  = glGetUniformLocation(r->prog_hud, "uOrtho");
+    GLint hastex_loc = glGetUniformLocation(r->prog_hud, "uHasTex");
+    GLint tex_loc    = glGetUniformLocation(r->prog_hud, "uTex");
+    glUniformMatrix4fv(ortho_loc, 1, GL_FALSE, &ortho.m[0][0]);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glBindVertexArray(r->hud_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, r->hud_vbo);
+
+    /* Helper: flush and draw current batch with given texture */
+    #define HUD_FLUSH(tex_id, has_tex) do { \
+        if (nv > 0) { \
+            glUniform1i(hastex_loc, (has_tex) ? 1 : 0); \
+            glUniform1i(tex_loc, 0); \
+            glActiveTexture(GL_TEXTURE0); \
+            { u32 _hf_tid = (u32)(tex_id); \
+              if (has_tex && _hf_tid != 0 && _hf_tid <= r->texture_count) \
+                glBindTexture(GL_TEXTURE_2D, r->textures[_hf_tid-1].handle); \
+              else \
+                glBindTexture(GL_TEXTURE_2D, 0); \
+            } \
+            glBufferSubData(GL_ARRAY_BUFFER, 0, nv * HUD_STRIDE * sizeof(f32), vbuf); \
+            glDrawArrays(GL_TRIANGLES, 0, (GLsizei)nv); \
+            nv = 0; \
+        } \
+    } while(0)
+
+    /* Enable blending for alpha (death vignette, semi-transparent elements) */
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    /* ---- Death screen vignette ---- */
+    if (hud->dead) {
+        hud_quad(vbuf, &nv, 0, 0, W, H, 0,0,0,0, 0.6f,0,0, 0.4f);
+        HUD_FLUSH(0, false);
+    }
+
+    /* ---- Status bar layout (Outlaws-faithful) ----
+     *
+     * Scale factors derived from original 640×480 Jedi Engine reference (Ghidra confirmed):
+     *   sx = W/640, sy = H/480
+     *   Panel (INTERFAC.NWX): 640×43 at 480 reference → bar_h = 43*sy ≈ 64.5px at 720p
+     *   Ammo digits x:  0xC4 * sx = 196 * sx
+     *   Hearts x start: 0x222 * sx = 546 * sx, step = heart_w/4, 10 hearts right-to-left
+     *
+     * Rendering order:
+     *   1. Solid dark background (fills bar area — prevents 3D world showing through
+     *      transparent holes in INTERFAC.NWX on levels like CANYON)
+     *   2. INTERFAC.NWX panel texture on top (transparent pixels reveal dark background)
+     *   3. HUD elements (ammo, face portrait, hearts)
+     */
+    {
+        f32 sx    = W / 640.0f;
+        f32 sy    = H / 480.0f;
+
+        /* Bar height from INTERFAC.NWX FRMT off_y=-42 → 43px at 480 reference */
+        f32 bar_h = 43.0f * sy;
+        f32 by    = H - bar_h;
+
+        /* Step 1: solid dark background behind everything */
+        hud_quad(vbuf, &nv, 0, by, W, H, 0,0,0,0, 0.07f,0.05f,0.03f,1.0f);
+        HUD_FLUSH(0, false);
+
+        /* ---- Digit rendering helper ----
+         * Left-aligns number starting at pixel x=lx, top y=dy, digit height=dh.
+         */
+        #define DRAW_DIGITS(value, lx, dy, dh, cr, cg, cb) do { \
+            char _buf[8]; \
+            int _n = snprintf(_buf, sizeof(_buf), "%d", (value)); \
+            f32 _dh = (dh); \
+            f32 _dw; { \
+                u32 _d0 = r->digit_tex[0]; \
+                if (_d0 && _d0 <= r->texture_count && r->textures[_d0-1].height > 0) \
+                    _dw = _dh * (f32)r->textures[_d0-1].width / (f32)r->textures[_d0-1].height; \
+                else \
+                    _dw = _dh * 34.0f / 66.0f; \
+            } \
+            f32 _spacing = _dw + 1.0f; \
+            f32 _x = (lx); \
+            for (int _i = 0; _i < _n; _i++, _x += _spacing) { \
+                int _d = _buf[_i] - '0'; \
+                if (_d < 0 || _d > 9) continue; \
+                u32 _tid = r->digit_tex[_d]; \
+                if (_tid && _tid <= r->texture_count) { \
+                    hud_quad(vbuf, &nv, _x, (dy), _x+_dw, (dy)+_dh, \
+                             0,0,1,1, (cr),(cg),(cb),1.0f); \
+                    HUD_FLUSH(_tid, true); \
+                } else { \
+                    hud_quad(vbuf, &nv, _x+1, (dy)+2, _x+_dw-1, (dy)+_dh-2, \
+                             0,0,0,0, (cr),(cg),(cb),0.85f); \
+                    HUD_FLUSH(0, false); \
+                } \
+            } \
+        } while(0)
+
+        /* Ghidra RE of HUD layout. Cartridges and hearts have their BOTTOM
+         * behind the bar and their TOP protruding above it. The bar covers
+         * the lower portion of these sprites (like a shelf). */
+
+        /* ---- Clip ammo cartridges (left, above "AMMO") ----
+         * Ghidra: each weapon's NWX seq 11 = ammo sprite.
+         * clip_size < 13 → 1 icon per round. >= 13 → 1 icon per 10.
+         * Positioned right-to-left, x_base ≈ 0x4A/640 * W. */
+        {
+            int wi = hud->weapon_idx;
+            u32 ammo_tex = (wi >= 0 && wi < WEAPON_COUNT) ? r->weapon_ammo_tex[wi] : 0;
+            if (hud->clip_size > 0 && hud->ammo > 0 && ammo_tex && ammo_tex <= r->texture_count) {
+                const GpuTexture *at = &r->textures[ammo_tex - 1];
+                /* Ghidra: ammo_per_icon = (clip_size < 13) ? 1 : 10 */
+                i32 ammo_per_icon = (hud->clip_size < 13) ? 1 : 10;
+                i32 n_icons = hud->ammo / ammo_per_icon;
+                if (n_icons > 12) n_icons = 12;
+                if (n_icons < 0) n_icons = 0;
+
+                f32 shell_h = bar_h * 1.5f;
+                f32 shell_w = (at->width > 0 && at->height > 0)
+                              ? shell_h * (f32)at->width / (f32)at->height : shell_h * 0.3f;
+                /* Ghidra spacing: min(shell_w*0.75, available_space/(n-1)) */
+                f32 shell_step = shell_w * 0.75f;
+                /* Ghidra: x_base ≈ 74/640 * W, rightmost = x_base + total_span/2 */
+                f32 x_base = 74.0f * sx;
+                f32 x_start = x_base + (shell_w * 0.5f + shell_step * (f32)(n_icons - 1)) * 0.5f;
+                /* Shell top protrudes well above bar, bottom hidden behind */
+                f32 shell_y = by - shell_h * 0.6f;
+                for (i32 ci = 0; ci < n_icons; ci++) {
+                    f32 shx = x_start - (f32)ci * shell_step;
+                    hud_quad(vbuf, &nv, shx, shell_y, shx + shell_w, shell_y + shell_h,
+                             0, 0, 1, 1, 1, 1, 1, 1);
+                    HUD_FLUSH(ammo_tex, true);
+                }
+            }
+        }
+
+        /* ---- Reserve ammo digits (above "RESERVE", ~196/640) ---- */
+        {
+            f32 dh     = bar_h * 1.4f;
+            f32 dy     = by - dh * 0.7f;
+            f32 ammo_x = 200.0f * sx;
+            DRAW_DIGITS(OL_CLAMP(hud->reserve, 0, 999), ammo_x, dy, dh,
+                        1, 1, 1);
+        }
+
+        /* ---- Center: thermometer/energy (INTNERGY.NWX) ---- */
+        if (r->hud_energy_cell_count > 0) {
+            f32 hp_frac = OL_CLAMP((f32)hud->health / (f32)hud->max_health, 0.0f, 1.0f);
+            u32 ecell_idx = (u32)(hp_frac * (f32)(r->hud_energy_cell_count - 1) + 0.5f);
+            if (ecell_idx >= r->hud_energy_cell_count)
+                ecell_idx = r->hud_energy_cell_count - 1;
+            u32 etex = r->hud_energy_cells[ecell_idx];
+            if (etex && etex <= r->texture_count) {
+                const GpuTexture *et = &r->textures[etex - 1];
+                f32 eh = bar_h * 0.7f;
+                f32 ew = (et->width > 0 && et->height > 0)
+                         ? eh * (f32)et->width / (f32)et->height : eh * 3.0f;
+                f32 ex = W * 0.5f - ew * 0.5f;
+                f32 ey = by + (bar_h - eh) * 0.5f;
+                hud_quad(vbuf, &nv, ex, ey, ex + ew, ey + eh, 0, 0, 1, 1, 1, 1, 1, 1);
+                HUD_FLUSH(etex, true);
+            }
+        }
+
+        /* ---- Right: 10 hearts (above "HEALTH") ----
+         * Ghidra RE: heart_step = heart_w / 4 (25% of width = tight overlap).
+         * x_base = 0x222 * W/640 = 546/640 * W.
+         * x_start = x_base + (heart_w/2 + step*9) / 2.
+         * Bottom of hearts at screen bottom, top protrudes above bar. */
+        if (r->hud_heart_tex && r->hud_heart_tex <= r->texture_count) {
+            f32 hp_frac = OL_CLAMP((f32)hud->health / (f32)hud->max_health, 0.0f, 1.0f);
+            int full_hearts = (int)(hp_frac * 10.0f + 0.5f);
+            if (full_hearts > 10) full_hearts = 10;
+
+            const GpuTexture *ht = &r->textures[r->hud_heart_tex - 1];
+            f32 heart_h = bar_h * 1.5f;
+            f32 heart_w = (ht->width > 0 && ht->height > 0)
+                          ? heart_h * (f32)ht->width / (f32)ht->height : heart_h * 0.5f;
+            /* Ghidra: step = heart_w * 0x4000 >> 16 = heart_w / 4 */
+            f32 heart_step = heart_w * 0.25f;
+
+            /* Ghidra: x_base = 0x222 * scaleX >> 16 */
+            f32 x_base = 546.0f / 640.0f * W;
+            f32 x_start = x_base + (heart_w * 0.5f + heart_step * 9.0f) * 0.5f;
+            /* Hearts top protrudes well above bar */
+            f32 heart_y = by - heart_h * 0.6f;
+
+            for (int hi = 0; hi < 10; hi++) {
+                f32 hx = x_start - (f32)hi * heart_step;
+                if (hi < full_hearts) {
+                    hud_quad(vbuf, &nv, hx, heart_y, hx + heart_w, heart_y + heart_h,
+                             0, 0, 1, 1, 1, 1, 1, 1);
+                    HUD_FLUSH(r->hud_heart_tex, true);
+                }
+            }
+        }
+
+        /* Step LAST: INTERFAC.NWX panel bar rendered ON TOP of everything.
+         * The bar covers the bottom portion of cartridges/hearts, creating
+         * the "shelf" effect where only the tops protrude above. */
+        if (r->hud_panel_tex && r->hud_panel_tex <= r->texture_count) {
+            hud_quad(vbuf, &nv, 0, by, W, H, 0,0,1,1, 1,1,1,1);
+            HUD_FLUSH(r->hud_panel_tex, true);
+        }
+
+        #undef DRAW_DIGITS
+    }
+
+    /* ---- First-person weapon sprite (multi-frame fire/reload animation) ----
+     *
+     * Each animation frame's cell carries its own FRMT anchor offset (off_x,
+     * off_y) and pixel size. All frames of a weapon share one sprite origin
+     * placed at the bottom-center of a native 640x480 canvas, so the hand stays
+     * put while the gun recoils. We map native coords to the window with a
+     * uniform vertical scale (H/480) and center horizontally, preserving the
+     * sprite's aspect ratio on wide displays. */
+    if (!hud->dead) {
+        int wi = hud->weapon_idx;
+        if (wi >= 0 && wi < WEAPON_COUNT && r->weapon_hud_tex[wi]) {
+            /* Selected frame texture + its native anchor geometry. */
+            u32 tid = r->weapon_hud_tex[wi];
+            i32 fox = r->weapon_idle_ox[wi], foy = r->weapon_idle_oy[wi];
+            u32 fw  = r->weapon_idle_w[wi],  fh  = r->weapon_idle_h[wi];
+            bool ftrans = false;
+
+            if (hud->firing) {
+                u32 *frames = hud->fire_alt ? r->weapon_fire2_frames[wi]
+                                            : r->weapon_fire_frames[wi];
+                u32 *dts    = hud->fire_alt ? r->weapon_fire2_dt[wi]
+                                            : r->weapon_fire_dt[wi];
+                u32 nframes = hud->fire_alt ? r->weapon_fire2_frame_count[wi]
+                                            : r->weapon_fire_frame_count[wi];
+                i32 *oxs    = hud->fire_alt ? r->weapon_fire2_ox[wi]
+                                            : r->weapon_fire_ox[wi];
+                i32 *oys    = hud->fire_alt ? r->weapon_fire2_oy[wi]
+                                            : r->weapon_fire_oy[wi];
+                u32 *ws     = hud->fire_alt ? r->weapon_fire2_w[wi]
+                                            : r->weapon_fire_w[wi];
+                u32 *hs     = hud->fire_alt ? r->weapon_fire2_h[wi]
+                                            : r->weapon_fire_h[wi];
+                u8  *trs    = hud->fire_alt ? r->weapon_fire2_trans[wi]
+                                            : r->weapon_fire_trans[wi];
+                if (nframes > 0) {
+                    u32 total_ms = 0;
+                    for (u32 fi = 0; fi < nframes; fi++) total_ms += dts[fi];
+                    f32 elapsed_ms = hud->fire_timer * (f32)total_ms;
+                    u32 accum = 0, frame_idx = nframes - 1;
+                    for (u32 fi = 0; fi < nframes; fi++) {
+                        accum += dts[fi];
+                        if (elapsed_ms < (f32)accum) { frame_idx = fi; break; }
+                    }
+                    if (frames[frame_idx]) {
+                        tid = frames[frame_idx];
+                        fox = oxs[frame_idx]; foy = oys[frame_idx];
+                        fw  = ws[frame_idx];  fh  = hs[frame_idx];
+                        ftrans = trs[frame_idx] != 0;
+                    }
+                }
+            } else if (hud->reloading && r->weapon_reload_frame_count[wi] > 0) {
+                /* Cycle reload frames on a free-running timer. */
+                u32 nframes = r->weapon_reload_frame_count[wi];
+                u32 total_ms = 0;
+                for (u32 fi = 0; fi < nframes; fi++) total_ms += r->weapon_reload_dt[wi][fi];
+                if (total_ms == 0) total_ms = nframes * 100u;
+                u32 elapsed = (u32)SDL_GetTicks() % total_ms;
+                u32 accum = 0, frame_idx = nframes - 1;
+                for (u32 fi = 0; fi < nframes; fi++) {
+                    accum += r->weapon_reload_dt[wi][fi];
+                    if (elapsed < accum) { frame_idx = fi; break; }
+                }
+                if (r->weapon_reload_frames[wi][frame_idx]) {
+                    tid = r->weapon_reload_frames[wi][frame_idx];
+                    fox = r->weapon_reload_ox[wi][frame_idx];
+                    foy = r->weapon_reload_oy[wi][frame_idx];
+                    fw  = r->weapon_reload_w[wi][frame_idx];
+                    fh  = r->weapon_reload_h[wi][frame_idx];
+                }
+            }
+
+            if (tid > 0 && tid <= r->texture_count && fw > 0 && fh > 0) {
+                /* Native origin at bottom-center (320, 480). */
+                f32 s  = H / 480.0f;
+                f32 x0 = W * 0.5f + (f32)fox * s;
+                f32 y0 = (480.0f + (f32)foy) * s;
+                f32 x1 = x0 + (f32)fw * s;
+                f32 y1 = y0 + (f32)fh * s;
+                hud_quad(vbuf, &nv, x0, y0, x1, y1, 0,0,1,1, 1,1,1,1);
+                (void)ftrans; /* Glow is baked as per-pixel alpha at decode time. */
+                HUD_FLUSH(tid, true);
+            }
+        }
+    }
+
+    /* ---- On-screen message (USER_MSG / level events), centered near top ---- */
+    if (hud->message && hud->message[0]) {
+        const char *msg = hud->message;
+        int len = (int)strlen(msg);
+        f32 px = OL_MAX(2.0f, H / 260.0f);  /* pixel size, scales with resolution */
+        f32 char_w = 6.0f * px;             /* 5 cols + 1 spacing */
+        f32 total_w = len * char_w;
+        f32 sx = (W - total_w) * 0.5f;
+        f32 sy = H * 0.12f;
+        /* Shadow + text: draw each lit font pixel as a small quad. */
+        for (int pass = 0; pass < 2; pass++) {
+            f32 ox = (pass == 0) ? px : 0.0f, oy = (pass == 0) ? px : 0.0f;
+            f32 cr = (pass == 0) ? 0.0f : 1.0f;
+            f32 cg = (pass == 0) ? 0.0f : 0.92f;
+            f32 cb = (pass == 0) ? 0.0f : 0.55f;
+            for (int ci = 0; ci < len; ci++) {
+                int gi = font5x7_index(msg[ci]);
+                const unsigned char *gl = FONT5X7[gi];
+                f32 gx = sx + ci * char_w + ox;
+                for (int col = 0; col < 5; col++) {
+                    for (int row = 0; row < 7; row++) {
+                        if (!(gl[col] & (1 << row))) continue;
+                        f32 qx = gx + col * px, qy = sy + row * px + oy;
+                        hud_quad(vbuf, &nv, qx, qy, qx + px, qy + px,
+                                 0,0,0,0, cr, cg, cb, 1.0f);
+                    }
+                }
+            }
+            HUD_FLUSH(0, false);
+        }
+    }
+
+    /* ---- Inventory readout (held keys/tools), top-left, one item per line ---- */
+    if (hud->inventory && hud->inventory[0]) {
+        f32 px = OL_MAX(1.0f, H / 400.0f);
+        f32 char_w = 6.0f * px, line_h = 9.0f * px;
+        f32 sx = 8.0f * px, sy = H * 0.14f;
+        int line = 0, col0 = 0;
+        const char *s = hud->inventory;
+        for (int i = 0; ; i++) {
+            char c = s[i];
+            if (c == '\n' || c == '\0') {
+                HUD_FLUSH(0, false);  /* flush per line — keeps vbuf under cap */
+                line++; col0 = i + 1;
+                if (c == '\0') break;
+                continue;
+            }
+            int gi = font5x7_index(c);
+            const unsigned char *gl = FONT5X7[gi];
+            f32 gx = sx + (i - col0) * char_w;
+            f32 gy = sy + line * line_h;
+            for (int pass = 0; pass < 2; pass++) {
+                f32 ox = (pass == 0) ? px : 0.0f, oy = (pass == 0) ? px : 0.0f;
+                f32 cr = (pass == 0) ? 0.0f : 1.0f;
+                f32 cg = (pass == 0) ? 0.0f : 0.85f;
+                f32 cb = (pass == 0) ? 0.0f : 0.30f;
+                for (int col = 0; col < 5; col++)
+                    for (int row = 0; row < 7; row++) {
+                        if (!(gl[col] & (1 << row))) continue;
+                        f32 qx = gx + col * px + ox, qy = gy + row * px + oy;
+                        hud_quad(vbuf, &nv, qx, qy, qx + px, qy + px,
+                                 0,0,0,0, cr, cg, cb, 1.0f);
+                    }
+            }
+        }
+    }
+
+    /* ---- Crosshair ---- */
+    if (hud->show_crosshair) {
+        f32 cx = W*0.5f, cy = H*0.5f;
+        f32 cs = 10, ct = 2;
+        /* Gap in center for classic FPS crosshair look */
+        hud_quad(vbuf, &nv, cx-cs, cy-ct*0.5f, cx-4, cy+ct*0.5f, 0,0,0,0, 1,1,1,0.85f);
+        hud_quad(vbuf, &nv, cx+4,  cy-ct*0.5f, cx+cs, cy+ct*0.5f, 0,0,0,0, 1,1,1,0.85f);
+        hud_quad(vbuf, &nv, cx-ct*0.5f, cy-cs, cx+ct*0.5f, cy-4, 0,0,0,0, 1,1,1,0.85f);
+        hud_quad(vbuf, &nv, cx-ct*0.5f, cy+4,  cx+ct*0.5f, cy+cs, 0,0,0,0, 1,1,1,0.85f);
+        HUD_FLUSH(0, false);
+    }
+
+    #undef HUD_FLUSH
+
+    glBindVertexArray(0);
+    glUseProgram(0);
+    glDisable(GL_BLEND);
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_CULL_FACE);
+}
+
+void renderer_resize(Renderer *r, int width, int height) {
+    r->cfg.width  = width;
+    r->cfg.height = height;
+    glViewport(0, 0, width, height);
+    f32 hfov_rad = r->cfg.fov * OL_DEG2RAD;
+    f32 aspect   = (f32)width / (f32)height;
+    f32 fov_rad  = 2.0f * atanf(tanf(hfov_rad * 0.5f) / aspect);
+    r->proj = mat4_perspective(fov_rad, aspect, r->cfg.near_plane, r->cfg.far_plane);
+    r->cam_fov_rad = fov_rad;
+}
