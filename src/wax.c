@@ -311,9 +311,10 @@ static u32 expand_token_stream(const WaxSprite *sprite, const u16 *seq,
         case 0xFFFB: /* event with `param` extra inline words */
             t += param;
             break;
-        case 0xFFFC: /* chain chor */
-        case 0xFFFA: /* jump to frame */
-        case 0xFFF7: /* sound/callback */
+        case 0xFFFC: /* chain chor (extra word = target chor) */
+        case 0xFFFA: /* jump to frame (extra word = position) */
+        case 0xFFFD: /* play sound (extra word = sounds.lst index) */
+        case 0xFFF7: /* play sound variant */
             t += 1;
             break;
         default:

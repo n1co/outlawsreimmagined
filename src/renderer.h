@@ -88,6 +88,13 @@ typedef struct {
     bool firing;            /* True during weapon fire animation */
     bool fire_alt;          /* True if this was an alternate fire */
     f32  fire_timer;        /* Normalized fire animation progress [0..1] */
+    bool cooking;           /* Thrown-weapon wind-up held (arm back pose):
+                             * shows the throw chor's first frame while the
+                             * button is held (chor 0xFFF9 hold semantics) */
+    bool cooking_alt;       /* Wind-up pose comes from FIRE_CHOR_2 (dynamite)
+                             * instead of FIRE_CHOR_1 (knife) */
+    bool holding_lit;       /* Lit dynamite in hand: hold the light chor's
+                             * last frame (burning stick) */
     bool reloading;         /* Currently reloading */
     const char *message;    /* On-screen message (NULL/empty = none) */
     const char *inventory;  /* Held inventory items, one per line (NULL = none) */
@@ -209,6 +216,13 @@ typedef struct {
     f32 cam_yaw;
     f32 cam_pitch;
     f32 cam_fov_rad;
+    f32 view_zoom;    /* Scope zoom factor (0/1 = none) */
+
+    /* Uploaded 3DO models (CPU-side colored tri lists, sprite-shader layout) */
+    #define R_MAX_TDO 8
+    f32 *tdo_data[R_MAX_TDO];     /* 9 floats/vert: pos3 uv2 rgba4 */
+    u32  tdo_vcount[R_MAX_TDO];
+    u32  tdo_count;
 } Renderer;
 
 /* Initialize renderer, create window and GL context. Returns false on error. */
@@ -239,6 +253,36 @@ bool renderer_build_level(Renderer *r, const LvtLevel *level, const InfSystem *i
  * Call each frame after inf_update() to animate scroll-floor meshes.
  */
 void renderer_sync_scroll(Renderer *r, const InfSystem *inf);
+
+/* Simple world-space billboard (projectiles, FX). pos = base (bottom
+ * center) in LVT coordinates. */
+typedef struct {
+    Vec3 pos;
+    u32  tex;     /* renderer texture id (1-based) */
+    f32  w, h;    /* world-unit size */
+} BillboardDraw;
+
+/* Draw a batch of camera-facing billboards with the sprite shader. */
+void renderer_draw_billboards(Renderer *r, const BillboardDraw *list, u32 count);
+
+/* View zoom (rifle scope): narrows the horizontal FOV by `zoom` (1 = none). */
+void renderer_set_zoom(Renderer *r, f32 zoom);
+
+/* Flat-shaded 3DO model instances (thrown knife/dynamite, ground objects —
+ * the original renders these as untextured palette-colored models). */
+typedef struct {
+    Vec3 pos;      /* LVT world position (model origin) */
+    f32  yaw;      /* Heading (radians) */
+    f32  tumble;   /* End-over-end tumble angle (radians) */
+    int  id;       /* From renderer_upload_tdo */
+} TdoDraw;
+
+struct TdoModel;
+/* Build a CPU-side colored triangle list from a parsed 3DO. Returns id ≥ 0
+ * or -1. pal = 256-color palette for the per-triangle color indices. */
+int renderer_upload_tdo(Renderer *r, const struct TdoModel *m,
+                        const u8 pal[256][3]);
+void renderer_draw_tdos(Renderer *r, const TdoDraw *list, u32 count);
 
 /* Render the level. */
 void renderer_draw_level(Renderer *r);

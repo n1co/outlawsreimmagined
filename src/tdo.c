@@ -21,12 +21,13 @@ static int tp_tok(Tp *t, char *buf, int sz) {
     while (t->p < t->end && n < sz-1) {
         char c = *t->p;
         if (c == '#' || c <= ' ') break;
-        /* Handle quoted strings */
+        /* Handle quoted strings. Real files have unterminated quotes
+         * (`OBJECT "DEFAULT`) — stop at end of line too. */
         if (c == '"') {
             t->p++;
-            while (t->p < t->end && *t->p != '"' && n < sz-1)
+            while (t->p < t->end && *t->p != '"' && *t->p != '\n' && n < sz-1)
                 buf[n++] = *t->p++;
-            if (t->p < t->end) t->p++;
+            if (t->p < t->end && *t->p == '"') t->p++;
             break;
         }
         buf[n++] = c; t->p++;
@@ -133,9 +134,10 @@ bool tdo_parse(TdoModel *model, const char *text, u32 text_len) {
                         if (strcasecmp(tok, "FLAT")    == 0) tri->shading = 0;
                         else if (strcasecmp(tok, "GOURAUD") == 0) tri->shading = 1;
                         else tri->shading = 0;
-                        /* Skip "# material" comment */
-                        tp_skip(&t);
-                        if (t.p < t.end && *t.p == '#') { while (t.p < t.end && *t.p != '\n') t.p++; }
+                        /* Rest of the line = material name (often WITHOUT a
+                         * leading '#') and/or a comment — one triangle per
+                         * line, so skip to end of line unconditionally. */
+                        while (t.p < t.end && *t.p != '\n') t.p++;
                     }
                 } else if (!tok[0]) {
                     break;

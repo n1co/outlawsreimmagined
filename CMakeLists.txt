@@ -46,6 +46,8 @@ set(ENGINE_SOURCES
     src/wax.c
     src/tdo.c
     src/obt.c
+    src/itm.c
+    src/projectile.c
     src/renderer.c
     src/input.c
     src/player.c

@@ -6,6 +6,8 @@
 #include <math.h>
 #include <string.h>
 
+static void scenery_update(Entity *e, f32 dt);
+
 /* -------------------------------------------------------------------------
  * Sector point-in-polygon test (duplicated from collision.c for floor snap)
  * ---------------------------------------------------------------------- */
@@ -424,8 +426,12 @@ void entity_update_all(EntityList *list, Vec3 player_pos, f32 dt,
             update_enemy_animation(e, dt);
         }
 
-        /* Advance sprite animation timer for animated entities */
-        if (e->anim_count > 1) {
+        /* Scenery chor playback (Inv_Object state machine) */
+        if (e->is_scenery && e->scn_count > 0) {
+            scenery_update(e, dt);
+        }
+        /* Advance sprite animation timer for animated entities (non-scenery) */
+        else if (e->anim_count > 1) {
             e->anim_timer += dt;
             f32 frame_sec = (f32)e->anim_dt_ms / 1000.0f;
             if (frame_sec < 0.033f) frame_sec = 0.1f; /* clamp to min 3fps */
@@ -435,6 +441,93 @@ void entity_update_all(EntityList *list, Vec3 player_pos, f32 dt,
             }
         }
     }
+}
+
+/* -------------------------------------------------------------------------
+ * Scenery (Inv_Object) chor state machine
+ * Ghidra: Inv_Object@0x418da0 msg 120: a qualifying hit advances the wax to
+ * the NEXT chor (WaxInst_SetState(cur+1), bounds-checked, no hit points).
+ * ---------------------------------------------------------------------- */
+static void (*g_scn_play_sfx)(i32 sounds_lst_idx, Vec3 pos) = NULL;
+
+void entity_set_sfx_callback(void (*play)(i32 sounds_lst_idx, Vec3 pos)) {
+    g_scn_play_sfx = play;
+}
+
+static void scenery_set_state(Entity *e, u32 state) {
+    /* WaxInst_SetState bounds-checks against nChors: past-the-end = no-op. */
+    if (state >= e->scn_count) return;
+    e->scn_state   = state;
+    e->scn_frame   = 0;
+    e->scn_timer   = 0.0f;
+    e->scn_playing = true;
+    const ScnChor *ch = &e->scn[state];
+    if (ch->sound_idx >= 0 && g_scn_play_sfx)
+        g_scn_play_sfx(ch->sound_idx, e->pos);
+}
+
+/* Advance the current chor. Frame words display at the chor rate; the
+ * terminal opcode decides what happens at the end of the stream. */
+static void scenery_update(Entity *e, f32 dt) {
+    const ScnChor *ch = &e->scn[e->scn_state];
+    if (!e->scn_playing || ch->nframes == 0) return;
+
+    e->scn_timer += dt;
+    f32 frame_sec = (ch->dt_ms > 0) ? (f32)ch->dt_ms / 1000.0f : 0.1f;
+    while (e->scn_timer >= frame_sec && e->scn_playing) {
+        e->scn_timer -= frame_sec;
+        if (e->scn_frame + 1 < ch->nframes) {
+            e->scn_frame++;
+            continue;
+        }
+        /* End of stream: terminal opcode */
+        switch (ch->end) {
+        case SCN_END_LOOP:
+            e->scn_frame = 0;
+            break;
+        case SCN_END_TERMINATE:
+            /* 0xFFF8: logic frees the actor (bottle shatters away) */
+            e->active = false;
+            e->scn_playing = false;
+            break;
+        case SCN_END_SETSTATE:
+            scenery_set_state(e, ch->end_state);
+            return;
+        case SCN_END_STOP:
+        default:
+            /* Hold the last frame forever (debris stays) */
+            e->scn_playing = false;
+            break;
+        }
+    }
+}
+
+/* Advance to the next chor (damage/nudge reaction). */
+static void scenery_advance(Entity *e) {
+    scenery_set_state(e, e->scn_state + 1);
+}
+
+int entity_nudge(EntityList *list, Vec3 origin, Vec3 dir, f32 reach) {
+    /* Message 0x7D3 semantics (Actor_NudgeTrace@0x446cc0): USE/concussion
+     * reaches nearby scenery; both SHOOT (0x2000) and NUDGE (0x1000) types
+     * react. dir selects a frontal cone when non-zero. */
+    int hits = 0;
+    bool has_dir = (dir.x*dir.x + dir.y*dir.y + dir.z*dir.z) > 1e-6f;
+    for (u32 i = 0; i < list->count; i++) {
+        Entity *e = &list->entities[i];
+        if (!e->active || !e->is_scenery) continue;
+        if (e->scenery_type == SCENERY_PASS) continue;
+        Vec3 to = vec3_sub(e->pos, origin);
+        f32 d = vec3_len(to);
+        if (d > reach) continue;
+        if (has_dir && d > 1e-3f) {
+            f32 dot = (to.x*dir.x + to.y*dir.y + to.z*dir.z) / d;
+            if (dot < 0.5f) continue;  /* outside frontal cone */
+        }
+        scenery_advance(e);
+        hits++;
+    }
+    return hits;
 }
 
 /* -------------------------------------------------------------------------
@@ -478,8 +571,17 @@ int entity_raycast(const EntityList *list, const LvtLevel *level,
 
     for (u32 i = 0; i < list->count; i++) {
         const Entity *e = &list->entities[i];
-        if (!e->active || e->kind != ENTITY_ENEMY) continue;
-        if (e->ai_state == AI_DEAD) continue;
+        if (!e->active) continue;
+        /* Ray-solid targets: live enemies, and scenery with a TYPE field
+         * (actor flag 0x1000/0x2000 in the original — flag 0x400 scenery
+         * without TYPE lets rays pass, Ghidra filter @0x4e54c0). */
+        if (e->kind == ENTITY_ENEMY) {
+            if (e->ai_state == AI_DEAD) continue;
+        } else if (e->is_scenery) {
+            if (e->scenery_type == SCENERY_PASS) continue;
+        } else {
+            continue;
+        }
 
         /* Ray vs vertical cylinder (radius = sprite_w/2, height = sprite_h) */
         f32 rx = origin.x - e->pos.x;
@@ -527,7 +629,18 @@ int entity_raycast(const EntityList *list, const LvtLevel *level,
 bool entity_damage(EntityList *list, int idx, i32 amount) {
     if (idx < 0 || idx >= (i32)list->count) return false;
     Entity *e = &list->entities[idx];
-    if (!e->active || e->kind != ENTITY_ENEMY) return false;
+    if (!e->active) return false;
+
+    /* SHOOT scenery: a single qualifying hit advances the chor state — no
+     * hit points (Ghidra Inv_Object@0x418da0 msg 0x7D1 path). NUDGE-type
+     * scenery is ray-solid but does NOT react to bullets. */
+    if (e->is_scenery) {
+        if (e->scenery_type == SCENERY_SHOOT)
+            scenery_advance(e);
+        return false;
+    }
+
+    if (e->kind != ENTITY_ENEMY) return false;
     if (e->ai_state == AI_DEAD) return false;
 
     e->health -= amount;

@@ -64,6 +64,49 @@ typedef struct {
 } EntityAnimSeq;
 
 /* -------------------------------------------------------------------------
+ * Scenery (Inv_Object) choreography state machine — Ghidra RE of olwin.exe
+ * (Inv_Object@0x418da0, Wax_NextFrame@0x44ca00, WaxInst_SetState@0x44c7e0):
+ * an NWX chor is a bytecode script; state 0 is the spawn state; a qualifying
+ * hit/nudge advances the object to the NEXT chor (no hit points); the chor's
+ * terminal opcode decides the aftermath:
+ *   0xFFFF STOP      -> hold last frame forever (debris stays)
+ *   0xFFFE LOOP      -> repeat (ambient anims like lantern flames)
+ *   0xFFF8 TERMINATE -> delete the actor (bottle shatters away)
+ *   0xFFFC SETSTATE  -> jump to chor N (N=0: indestructible clang reaction)
+ * A 0xFFFD PLAYSOUND opcode carries a sounds.lst index played at the object.
+ * ---------------------------------------------------------------------- */
+#define SCN_MAX_CHORS   6
+#define SCN_MAX_FRAMES  16
+
+typedef enum {
+    SCN_END_STOP = 0,
+    SCN_END_LOOP,
+    SCN_END_TERMINATE,
+    SCN_END_SETSTATE,
+} ScnEnd;
+
+typedef struct {
+    u32 tex[SCN_MAX_FRAMES];      /* Display frame textures (renderer ids) */
+    f32 fw[SCN_MAX_FRAMES];       /* World-space size per frame */
+    f32 fh[SCN_MAX_FRAMES];
+    u32 nframes;
+    u32 dt_ms;                    /* Per-frame display time (from chor rate) */
+    i32 sound_idx;                /* sounds.lst index (-1 = none) */
+    u8  end;                      /* ScnEnd */
+    u8  end_state;                /* target chor for SCN_END_SETSTATE */
+} ScnChor;
+
+/* Ray-solidity / reaction class (actor+0x78 in the original):
+ * 0 = 0x0400 no TYPE field: rays pass through, purely decorative
+ * 1 = 0x1000 TYPE != SHOOT (e.g. NUDGE): ray-solid, reacts to USE/concussion
+ * 2 = 0x2000 TYPE SHOOT: ray-solid, reacts to bullets AND USE/concussion */
+typedef enum {
+    SCENERY_PASS  = 0,
+    SCENERY_NUDGE = 1,
+    SCENERY_SHOOT = 2,
+} SceneryType;
+
+/* -------------------------------------------------------------------------
  * Entity definition (one per entity in the level)
  * ---------------------------------------------------------------------- */
 #define ENTITY_NAME_LEN 64
@@ -108,6 +151,16 @@ typedef struct {
     f32           cur_anim_timer;
     bool          anim_loop;         /* false for die animation (play once) */
     bool          has_anim_seqs;     /* true if any anim_seqs were loaded */
+
+    /* Scenery chor state machine (Inv_Object decorations) */
+    bool        is_scenery;       /* Has ITM FUNC Inv_Object + chor data */
+    u8          scenery_type;     /* SceneryType */
+    ScnChor     scn[SCN_MAX_CHORS];
+    u32         scn_count;
+    u32         scn_state;        /* Current chor (0 = spawn state) */
+    u32         scn_frame;
+    f32         scn_timer;
+    bool        scn_playing;      /* Frames advancing (STOP clears) */
 
     /* Boss (SANCHEZ): dormant spawn candidate until the mission triggers it.
      * Boss candidates load inactive; one is activated when the kill quota is met. */
@@ -191,5 +244,15 @@ int entity_raycast(const EntityList *list, const LvtLevel *level,
                    Vec3 origin, Vec3 dir,
                    f32 max_dist, f32 *dist);
 
-/* Deal damage to entity at index. Returns true if it died. */
+/* Deal damage to entity at index. Returns true if it died.
+ * SHOOT scenery advances its chor state instead of losing health. */
 bool entity_damage(EntityList *list, int idx, i32 amount);
+
+/* Sound hook for scenery chor PLAYSOUND events: receives the sounds.lst
+ * index and the object position. Set once at startup (main.c). */
+void entity_set_sfx_callback(void (*play)(i32 sounds_lst_idx, Vec3 pos));
+
+/* USE/nudge/concussion delivery (message 0x7D3 semantics): advances the chor
+ * of SHOOT and NUDGE scenery within `reach` of origin along dir (or, for
+ * explosions, within radius when dir is zero). Returns hits. */
+int entity_nudge(EntityList *list, Vec3 origin, Vec3 dir, f32 reach);

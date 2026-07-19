@@ -90,6 +90,10 @@ typedef struct {
     const char *name;          /* ITM NAME field */
     const char *itm_file;      /* Source ITM filename (ij*.itm = James variant) */
     const char *ammo_type;     /* Ammo item name (ibullit, icart, ishells, etc.) */
+    /* Fire-mode button table (Ghidra 0x513c28..): result of LMB/RMB press.
+     * Most weapons {0,1}; rifle/shotgun {0,0} (identical); TNT {1,0} —
+     * INVERTED: LMB=throw(mode 1), RMB=light fuse(mode 0). */
+    i32         button_mode[2];
     f32         damage_1;      /* DAMAGE_1: primary fire damage per pellet */
     f32         damage_2;      /* DAMAGE_2: alternate fire damage per pellet */
     i32         clip_size;     /* SHOT_CAPACITY: rounds per clip (0 = no clip/melee) */
@@ -130,8 +134,24 @@ typedef struct {
     i32         clip[WEAPON_COUNT];      /* Loaded rounds in current clip */
     f32         fire_cooldown;           /* Time until next shot */
     bool        has_weapon[WEAPON_COUNT];
-    bool        reloading;               /* Currently in reload animation */
-    f32         reload_timer;            /* Reload time remaining */
+
+    /* Per-round reload (Weapon_ReloadStep @0x4709e0): the RELOAD_CHOR loops,
+     * adding ONE round per loop; interruptible by pressing fire. */
+    bool        reloading;
+    f32         reload_timer;            /* Time until next round loads */
+    bool        reload_interrupt;        /* Fire pressed during reload */
+
+    /* Cook state (knife LMB / TNT LMB wind-up): power = clamp(held, .5, 1) */
+    bool        cooking;
+    f32         cook_time;               /* Seconds the button has been held */
+    i32         cook_mode;               /* Fire mode being cooked */
+
+    /* Dynamite: a lit stick held in hand (fuse keeps running!) */
+    bool        holding_lit;
+    f32         lit_fuse;                /* Seconds until the held stick blows */
+
+    /* Rifle scope (toggle; requires the weapon's SCOPE_ITEM) */
+    bool        scope_active;
 } WeaponState;
 
 /* Initialize weapons (fist always available) */
@@ -153,6 +173,10 @@ bool weapon_can_fire(const WeaponState *ws);
 /* Fire primary (mode=0) or alternate (mode=1). Returns true if fired. */
 bool weapon_fire(WeaponState *ws);
 bool weapon_fire_alt(WeaponState *ws);
+
+/* Consume `rounds` loaded rounds and start the fire cooldown for `mode`
+ * (both-barrels shots pass rounds=2). Returns the rounds actually fired. */
+i32 weapon_consume(WeaponState *ws, i32 rounds, i32 mode);
 
 /* Start reload if needed and possible */
 void weapon_reload(WeaponState *ws);

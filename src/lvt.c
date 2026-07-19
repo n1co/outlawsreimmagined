@@ -178,6 +178,7 @@ static bool parse_sector(Parser *p, LvtSector *sec) {
     sec->ambient = 31;
     sec->friction = 1.0f;
     sec->gravity = -60.0f;
+    sec->elasticity = 0.3f;
     sec->floor_tex = -1;
     sec->ceil_tex  = -1;
 
@@ -216,7 +217,7 @@ static bool parse_sector(Parser *p, LvtSector *sec) {
             continue;
         }
         if (strcasecmp(tok, "ELASTICITY") == 0) {
-            read_float(p);
+            sec->elasticity = read_float(p);   /* bounce restitution (0.3) */
             continue;
         }
         if (strcasecmp(tok, "VELOCITY") == 0) {

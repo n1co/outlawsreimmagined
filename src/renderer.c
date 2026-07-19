@@ -1496,10 +1496,22 @@ void renderer_draw_sprites(Renderer *r, const EntityList *entities) {
             dir = (u32)(rel / (OL_PI / 4.0f) + 0.5f) % 8;
         }
 
-        /* Select texture: per-AI-state animation, cyclic decoration anim,
-         * or per-direction sprite_dir_tex[]. */
+        /* Select texture: scenery chor frame, per-AI-state animation, cyclic
+         * decoration anim, or per-direction sprite_dir_tex[]. */
         u32 tex_id;
-        if (e->has_anim_seqs && e->anim_seqs[e->cur_anim].frame_count > 0) {
+        if (e->is_scenery && e->scn_count > 0 &&
+            e->scn_state < e->scn_count &&
+            e->scn_frame < e->scn[e->scn_state].nframes) {
+            const ScnChor *ch = &e->scn[e->scn_state];
+            tex_id = ch->tex[e->scn_frame];
+            if (tex_id && ch->fh[e->scn_frame] > 0.0f) {
+                rw = ch->fw[e->scn_frame];
+                rh = ch->fh[e->scn_frame];
+                hw = rw * 0.5f;
+                h  = rh;
+            }
+            if (!tex_id) tex_id = e->sprite_tex;
+        } else if (e->has_anim_seqs && e->anim_seqs[e->cur_anim].frame_count > 0) {
             /* Enemy with per-AI-state animation sequences */
             const EntityAnimSeq *seq = &e->anim_seqs[e->cur_anim];
             u32 frame = e->cur_anim_frame;
@@ -1578,6 +1590,141 @@ void renderer_draw_sprites(Renderer *r, const EntityList *entities) {
         nv = 0;
     }
 
+    glBindVertexArray(0);
+    glUseProgram(0);
+}
+
+void renderer_draw_billboards(Renderer *r, const BillboardDraw *list, u32 count) {
+    if (!r->prog_sprite || !r->sprite_vao || !count) return;
+
+    Vec3 cr = r->cam_right;
+    Vec3 cu = r->cam_up;
+    Mat4 mvp = mat4_mul(r->proj, r->view);
+
+    glUseProgram(r->prog_sprite);
+    glUniformMatrix4fv(glGetUniformLocation(r->prog_sprite, "uMVP"),
+                       1, GL_FALSE, &mvp.m[0][0]);
+    glUniform1i(glGetUniformLocation(r->prog_sprite, "uTex"), 0);
+    GLint hastex_loc = glGetUniformLocation(r->prog_sprite, "uHasTex");
+    glBindVertexArray(r->sprite_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, r->sprite_vbo);
+
+    for (u32 i = 0; i < count; i++) {
+        const BillboardDraw *b = &list[i];
+        if (!b->tex || b->tex > r->texture_count) continue;
+        Vec3 base = { b->pos.x, b->pos.y, -b->pos.z };  /* LVT → GL */
+        f32 hw = b->w * 0.5f, h = b->h;
+        Vec3 bl  = vec3_sub(base, vec3_scale(cr, hw));
+        Vec3 br  = vec3_add(base, vec3_scale(cr, hw));
+        Vec3 tr_ = vec3_add(br, vec3_scale(cu, h));
+        Vec3 tl_ = vec3_add(bl, vec3_scale(cu, h));
+        f32 vb[6 * SPRITE_STRIDE];
+        u32 nv = 0;
+#define PUSH_B(vx,vy,vz,uu,vv) do { \
+        vb[nv*SPRITE_STRIDE+0]=(vx); vb[nv*SPRITE_STRIDE+1]=(vy); vb[nv*SPRITE_STRIDE+2]=(vz); \
+        vb[nv*SPRITE_STRIDE+3]=(uu); vb[nv*SPRITE_STRIDE+4]=(vv); \
+        vb[nv*SPRITE_STRIDE+5]=1; vb[nv*SPRITE_STRIDE+6]=1; vb[nv*SPRITE_STRIDE+7]=1; vb[nv*SPRITE_STRIDE+8]=1; \
+        nv++; } while (0)
+        PUSH_B(bl.x,bl.y,bl.z,   0,0);
+        PUSH_B(br.x,br.y,br.z,   1,0);
+        PUSH_B(tr_.x,tr_.y,tr_.z,1,1);
+        PUSH_B(bl.x,bl.y,bl.z,   0,0);
+        PUSH_B(tr_.x,tr_.y,tr_.z,1,1);
+        PUSH_B(tl_.x,tl_.y,tl_.z,0,1);
+#undef PUSH_B
+        glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(vb), vb);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, r->textures[b->tex - 1].handle);
+        glUniform1i(hastex_loc, 1);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+    }
+    glBindVertexArray(0);
+    glUseProgram(0);
+}
+
+/* -------------------------------------------------------------------------
+ * Flat-shaded 3DO model instances (untextured palette-colored triangles;
+ * matches the original's rendering of gknife/gdynam ground objects).
+ * ---------------------------------------------------------------------- */
+#include "tdo.h"
+
+int renderer_upload_tdo(Renderer *r, const struct TdoModel *m,
+                        const u8 pal[256][3]) {
+    if (r->tdo_count >= R_MAX_TDO) return -1;
+    u32 total = 0;
+    for (u32 o = 0; o < m->object_count; o++)
+        total += m->objects[o].tri_count * 3;
+    if (!total) return -1;
+    f32 *data = malloc((size_t)total * SPRITE_STRIDE * sizeof(f32));
+    if (!data) return -1;
+
+    u32 nv = 0;
+    for (u32 o = 0; o < m->object_count; o++) {
+        const TdoObject *ob = &m->objects[o];
+        for (u32 t = 0; t < ob->tri_count; t++) {
+            const TdoTriangle *tr = &ob->tris[t];
+            if (tr->a < 0 || tr->b < 0 || tr->c < 0) continue;
+            if ((u32)tr->a >= ob->vert_count || (u32)tr->b >= ob->vert_count ||
+                (u32)tr->c >= ob->vert_count) continue;
+            u8 ci = (u8)(tr->color & 0xFF);
+            f32 cr = pal ? pal[ci][0] / 255.0f : 0.8f;
+            f32 cg = pal ? pal[ci][1] / 255.0f : 0.2f;
+            f32 cb = pal ? pal[ci][2] / 255.0f : 0.2f;
+            const i32 idx[3] = { tr->a, tr->b, tr->c };
+            for (int k = 0; k < 3; k++) {
+                const Vec3 *v = &ob->verts[idx[k]].pos;
+                f32 *out = &data[(size_t)nv * SPRITE_STRIDE];
+                out[0]=v->x; out[1]=v->y; out[2]=v->z;
+                out[3]=0; out[4]=0;
+                out[5]=cr; out[6]=cg; out[7]=cb; out[8]=1.0f;
+                nv++;
+            }
+        }
+    }
+    if (!nv) { free(data); return -1; }
+    int id = (int)r->tdo_count++;
+    r->tdo_data[id]   = data;
+    r->tdo_vcount[id] = nv;
+    return id;
+}
+
+void renderer_draw_tdos(Renderer *r, const TdoDraw *list, u32 count) {
+    if (!r->prog_sprite || !r->sprite_vao || !count) return;
+
+    Mat4 mvp = mat4_mul(r->proj, r->view);
+    glUseProgram(r->prog_sprite);
+    glUniformMatrix4fv(glGetUniformLocation(r->prog_sprite, "uMVP"),
+                       1, GL_FALSE, &mvp.m[0][0]);
+    glUniform1i(glGetUniformLocation(r->prog_sprite, "uHasTex"), 0);
+    glBindVertexArray(r->sprite_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, r->sprite_vbo);
+
+    static f32 xbuf[4096 * SPRITE_STRIDE];
+    for (u32 i = 0; i < count; i++) {
+        const TdoDraw *d = &list[i];
+        if (d->id < 0 || d->id >= (int)r->tdo_count) continue;
+        const f32 *src = r->tdo_data[d->id];
+        u32 nv = r->tdo_vcount[d->id];
+        if (nv > 4096) nv = 4096;
+        f32 cy = cosf(d->yaw),    sy = sinf(d->yaw);
+        f32 ct = cosf(d->tumble), st = sinf(d->tumble);
+        for (u32 v = 0; v < nv; v++) {
+            const f32 *in = &src[(size_t)v * SPRITE_STRIDE];
+            /* tumble (rotate around model X), then yaw, then translate */
+            f32 x0 = in[0], y0 = in[1] * ct - in[2] * st,
+                z0 = in[1] * st + in[2] * ct;
+            f32 wx = d->pos.x + x0 * cy - z0 * sy;
+            f32 wz = d->pos.z + x0 * sy + z0 * cy;
+            f32 wy = d->pos.y + y0;
+            f32 *out = &xbuf[(size_t)v * SPRITE_STRIDE];
+            out[0] = wx; out[1] = wy; out[2] = -wz;   /* LVT → GL */
+            out[3] = in[3]; out[4] = in[4];
+            out[5] = in[5]; out[6] = in[6]; out[7] = in[7]; out[8] = in[8];
+        }
+        glBufferSubData(GL_ARRAY_BUFFER, 0,
+                        (GLsizeiptr)nv * SPRITE_STRIDE * sizeof(f32), xbuf);
+        glDrawArrays(GL_TRIANGLES, 0, (GLsizei)nv);
+    }
     glBindVertexArray(0);
     glUseProgram(0);
 }
@@ -1847,6 +1994,130 @@ void renderer_draw_hud(Renderer *r, const HudParams *hud) {
         HUD_FLUSH(0, false);
     }
 
+    /* The first-person weapon hand renders BEHIND the status bar
+     * (the original draws the view model in the 3D view, then the
+     * HUD panel over it) — so the weapon block comes first. */
+    /* ---- First-person weapon sprite (multi-frame fire/reload animation) ----
+     *
+     * Each animation frame's cell carries its own FRMT anchor offset (off_x,
+     * off_y) and pixel size. All frames of a weapon share one sprite origin
+     * placed at the bottom-center of a native 640x480 canvas, so the hand stays
+     * put while the gun recoils. We map native coords to the window with a
+     * uniform vertical scale (H/480) and center horizontally, preserving the
+     * sprite's aspect ratio on wide displays. */
+    if (!hud->dead) {
+        int wi = hud->weapon_idx;
+        if (wi >= 0 && wi < WEAPON_COUNT && r->weapon_hud_tex[wi]) {
+            /* Selected frame texture + its native anchor geometry. */
+            u32 tid = r->weapon_hud_tex[wi];
+            i32 fox = r->weapon_idle_ox[wi], foy = r->weapon_idle_oy[wi];
+            u32 fw  = r->weapon_idle_w[wi],  fh  = r->weapon_idle_h[wi];
+            bool ftrans = false;
+
+            bool cook_alt = hud->cooking && hud->cooking_alt &&
+                            r->weapon_fire2_frame_count[wi] > 0 &&
+                            r->weapon_fire2_frames[wi][0];
+            bool cook_pri = hud->cooking && !hud->cooking_alt &&
+                            r->weapon_fire_frame_count[wi] > 0 &&
+                            r->weapon_fire_frames[wi][0];
+            if (cook_alt || cook_pri) {
+                /* Wind-up hold: the throw chor's first frame (arm back),
+                 * frozen while the fire button is held (0xFFF9 pause). */
+                if (cook_alt) {
+                    tid = r->weapon_fire2_frames[wi][0];
+                    fox = r->weapon_fire2_ox[wi][0];
+                    foy = r->weapon_fire2_oy[wi][0];
+                    fw  = r->weapon_fire2_w[wi][0];
+                    fh  = r->weapon_fire2_h[wi][0];
+                    ftrans = r->weapon_fire2_trans[wi][0] != 0;
+                } else {
+                    tid = r->weapon_fire_frames[wi][0];
+                    fox = r->weapon_fire_ox[wi][0];
+                    foy = r->weapon_fire_oy[wi][0];
+                    fw  = r->weapon_fire_w[wi][0];
+                    fh  = r->weapon_fire_h[wi][0];
+                    ftrans = r->weapon_fire_trans[wi][0] != 0;
+                }
+            } else if (!hud->firing && hud->holding_lit &&
+                       r->weapon_fire_frame_count[wi] > 0) {
+                /* Lit stick in hand: hold the light chor's last frame */
+                u32 lf = r->weapon_fire_frame_count[wi] - 1;
+                if (r->weapon_fire_frames[wi][lf]) {
+                    tid = r->weapon_fire_frames[wi][lf];
+                    fox = r->weapon_fire_ox[wi][lf];
+                    foy = r->weapon_fire_oy[wi][lf];
+                    fw  = r->weapon_fire_w[wi][lf];
+                    fh  = r->weapon_fire_h[wi][lf];
+                    ftrans = r->weapon_fire_trans[wi][lf] != 0;
+                }
+            } else if (hud->firing) {
+                u32 *frames = hud->fire_alt ? r->weapon_fire2_frames[wi]
+                                            : r->weapon_fire_frames[wi];
+                u32 *dts    = hud->fire_alt ? r->weapon_fire2_dt[wi]
+                                            : r->weapon_fire_dt[wi];
+                u32 nframes = hud->fire_alt ? r->weapon_fire2_frame_count[wi]
+                                            : r->weapon_fire_frame_count[wi];
+                i32 *oxs    = hud->fire_alt ? r->weapon_fire2_ox[wi]
+                                            : r->weapon_fire_ox[wi];
+                i32 *oys    = hud->fire_alt ? r->weapon_fire2_oy[wi]
+                                            : r->weapon_fire_oy[wi];
+                u32 *ws     = hud->fire_alt ? r->weapon_fire2_w[wi]
+                                            : r->weapon_fire_w[wi];
+                u32 *hs     = hud->fire_alt ? r->weapon_fire2_h[wi]
+                                            : r->weapon_fire_h[wi];
+                u8  *trs    = hud->fire_alt ? r->weapon_fire2_trans[wi]
+                                            : r->weapon_fire_trans[wi];
+                if (nframes > 0) {
+                    u32 total_ms = 0;
+                    for (u32 fi = 0; fi < nframes; fi++) total_ms += dts[fi];
+                    f32 elapsed_ms = hud->fire_timer * (f32)total_ms;
+                    u32 accum = 0, frame_idx = nframes - 1;
+                    for (u32 fi = 0; fi < nframes; fi++) {
+                        accum += dts[fi];
+                        if (elapsed_ms < (f32)accum) { frame_idx = fi; break; }
+                    }
+                    if (frames[frame_idx]) {
+                        tid = frames[frame_idx];
+                        fox = oxs[frame_idx]; foy = oys[frame_idx];
+                        fw  = ws[frame_idx];  fh  = hs[frame_idx];
+                        ftrans = trs[frame_idx] != 0;
+                    }
+                }
+            } else if (hud->reloading && r->weapon_reload_frame_count[wi] > 0) {
+                /* Cycle reload frames on a free-running timer. */
+                u32 nframes = r->weapon_reload_frame_count[wi];
+                u32 total_ms = 0;
+                for (u32 fi = 0; fi < nframes; fi++) total_ms += r->weapon_reload_dt[wi][fi];
+                if (total_ms == 0) total_ms = nframes * 100u;
+                u32 elapsed = (u32)SDL_GetTicks() % total_ms;
+                u32 accum = 0, frame_idx = nframes - 1;
+                for (u32 fi = 0; fi < nframes; fi++) {
+                    accum += r->weapon_reload_dt[wi][fi];
+                    if (elapsed < accum) { frame_idx = fi; break; }
+                }
+                if (r->weapon_reload_frames[wi][frame_idx]) {
+                    tid = r->weapon_reload_frames[wi][frame_idx];
+                    fox = r->weapon_reload_ox[wi][frame_idx];
+                    foy = r->weapon_reload_oy[wi][frame_idx];
+                    fw  = r->weapon_reload_w[wi][frame_idx];
+                    fh  = r->weapon_reload_h[wi][frame_idx];
+                }
+            }
+
+            if (tid > 0 && tid <= r->texture_count && fw > 0 && fh > 0) {
+                /* Native origin at bottom-center (320, 480). */
+                f32 s  = H / 480.0f;
+                f32 x0 = W * 0.5f + (f32)fox * s;
+                f32 y0 = (480.0f + (f32)foy) * s;
+                f32 x1 = x0 + (f32)fw * s;
+                f32 y1 = y0 + (f32)fh * s;
+                hud_quad(vbuf, &nv, x0, y0, x1, y1, 0,0,1,1, 1,1,1,1);
+                (void)ftrans; /* Glow is baked as per-pixel alpha at decode time. */
+                HUD_FLUSH(tid, true);
+            }
+        }
+    }
+
     /* ---- Status bar layout (Outlaws-faithful) ----
      *
      * Scale factors derived from original 640×480 Jedi Engine reference (Ghidra confirmed):
@@ -2015,91 +2286,6 @@ void renderer_draw_hud(Renderer *r, const HudParams *hud) {
         #undef DRAW_DIGITS
     }
 
-    /* ---- First-person weapon sprite (multi-frame fire/reload animation) ----
-     *
-     * Each animation frame's cell carries its own FRMT anchor offset (off_x,
-     * off_y) and pixel size. All frames of a weapon share one sprite origin
-     * placed at the bottom-center of a native 640x480 canvas, so the hand stays
-     * put while the gun recoils. We map native coords to the window with a
-     * uniform vertical scale (H/480) and center horizontally, preserving the
-     * sprite's aspect ratio on wide displays. */
-    if (!hud->dead) {
-        int wi = hud->weapon_idx;
-        if (wi >= 0 && wi < WEAPON_COUNT && r->weapon_hud_tex[wi]) {
-            /* Selected frame texture + its native anchor geometry. */
-            u32 tid = r->weapon_hud_tex[wi];
-            i32 fox = r->weapon_idle_ox[wi], foy = r->weapon_idle_oy[wi];
-            u32 fw  = r->weapon_idle_w[wi],  fh  = r->weapon_idle_h[wi];
-            bool ftrans = false;
-
-            if (hud->firing) {
-                u32 *frames = hud->fire_alt ? r->weapon_fire2_frames[wi]
-                                            : r->weapon_fire_frames[wi];
-                u32 *dts    = hud->fire_alt ? r->weapon_fire2_dt[wi]
-                                            : r->weapon_fire_dt[wi];
-                u32 nframes = hud->fire_alt ? r->weapon_fire2_frame_count[wi]
-                                            : r->weapon_fire_frame_count[wi];
-                i32 *oxs    = hud->fire_alt ? r->weapon_fire2_ox[wi]
-                                            : r->weapon_fire_ox[wi];
-                i32 *oys    = hud->fire_alt ? r->weapon_fire2_oy[wi]
-                                            : r->weapon_fire_oy[wi];
-                u32 *ws     = hud->fire_alt ? r->weapon_fire2_w[wi]
-                                            : r->weapon_fire_w[wi];
-                u32 *hs     = hud->fire_alt ? r->weapon_fire2_h[wi]
-                                            : r->weapon_fire_h[wi];
-                u8  *trs    = hud->fire_alt ? r->weapon_fire2_trans[wi]
-                                            : r->weapon_fire_trans[wi];
-                if (nframes > 0) {
-                    u32 total_ms = 0;
-                    for (u32 fi = 0; fi < nframes; fi++) total_ms += dts[fi];
-                    f32 elapsed_ms = hud->fire_timer * (f32)total_ms;
-                    u32 accum = 0, frame_idx = nframes - 1;
-                    for (u32 fi = 0; fi < nframes; fi++) {
-                        accum += dts[fi];
-                        if (elapsed_ms < (f32)accum) { frame_idx = fi; break; }
-                    }
-                    if (frames[frame_idx]) {
-                        tid = frames[frame_idx];
-                        fox = oxs[frame_idx]; foy = oys[frame_idx];
-                        fw  = ws[frame_idx];  fh  = hs[frame_idx];
-                        ftrans = trs[frame_idx] != 0;
-                    }
-                }
-            } else if (hud->reloading && r->weapon_reload_frame_count[wi] > 0) {
-                /* Cycle reload frames on a free-running timer. */
-                u32 nframes = r->weapon_reload_frame_count[wi];
-                u32 total_ms = 0;
-                for (u32 fi = 0; fi < nframes; fi++) total_ms += r->weapon_reload_dt[wi][fi];
-                if (total_ms == 0) total_ms = nframes * 100u;
-                u32 elapsed = (u32)SDL_GetTicks() % total_ms;
-                u32 accum = 0, frame_idx = nframes - 1;
-                for (u32 fi = 0; fi < nframes; fi++) {
-                    accum += r->weapon_reload_dt[wi][fi];
-                    if (elapsed < accum) { frame_idx = fi; break; }
-                }
-                if (r->weapon_reload_frames[wi][frame_idx]) {
-                    tid = r->weapon_reload_frames[wi][frame_idx];
-                    fox = r->weapon_reload_ox[wi][frame_idx];
-                    foy = r->weapon_reload_oy[wi][frame_idx];
-                    fw  = r->weapon_reload_w[wi][frame_idx];
-                    fh  = r->weapon_reload_h[wi][frame_idx];
-                }
-            }
-
-            if (tid > 0 && tid <= r->texture_count && fw > 0 && fh > 0) {
-                /* Native origin at bottom-center (320, 480). */
-                f32 s  = H / 480.0f;
-                f32 x0 = W * 0.5f + (f32)fox * s;
-                f32 y0 = (480.0f + (f32)foy) * s;
-                f32 x1 = x0 + (f32)fw * s;
-                f32 y1 = y0 + (f32)fh * s;
-                hud_quad(vbuf, &nv, x0, y0, x1, y1, 0,0,1,1, 1,1,1,1);
-                (void)ftrans; /* Glow is baked as per-pixel alpha at decode time. */
-                HUD_FLUSH(tid, true);
-            }
-        }
-    }
-
     /* ---- On-screen message (USER_MSG / level events), centered near top ---- */
     if (hud->message && hud->message[0]) {
         const char *msg = hud->message;
@@ -2192,9 +2378,16 @@ void renderer_resize(Renderer *r, int width, int height) {
     r->cfg.width  = width;
     r->cfg.height = height;
     glViewport(0, 0, width, height);
-    f32 hfov_rad = r->cfg.fov * OL_DEG2RAD;
+    f32 zoom = (r->view_zoom > 1.0f) ? r->view_zoom : 1.0f;
+    f32 hfov_rad = (r->cfg.fov / zoom) * OL_DEG2RAD;
     f32 aspect   = (f32)width / (f32)height;
     f32 fov_rad  = 2.0f * atanf(tanf(hfov_rad * 0.5f) / aspect);
     r->proj = mat4_perspective(fov_rad, aspect, r->cfg.near_plane, r->cfg.far_plane);
     r->cam_fov_rad = fov_rad;
+}
+
+/* View zoom (rifle scope): narrows the FOV by `zoom` (1.0 = none). */
+void renderer_set_zoom(Renderer *r, f32 zoom) {
+    r->view_zoom = zoom;
+    renderer_resize(r, r->cfg.width, r->cfg.height);
 }

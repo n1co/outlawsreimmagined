@@ -5,6 +5,7 @@
 #include "pcx.h"
 #include "obt.h"
 #include "wax.h"
+#include "itm.h"
 #include "inf.h"
 #include "collision.h"
 #include <ctype.h>
@@ -660,6 +661,140 @@ static u32 load_entity_sprite_dirs(const char *type_name, const Archives *arc,
     return primary;
 }
 
+/* -------------------------------------------------------------------------
+ * Scenery (Inv_Object) chor loading — Ghidra RE of olwin.exe:
+ * Misc_CreateActorFromItem@0x4726c0 loads <class>.itm; FUNC selects the
+ * logic (Inv_Object@0x418da0 for destructible/nudgeable scenery); the NWX
+ * chors are bytecode scripts and state 0 is the spawn state.
+ * ---------------------------------------------------------------------- */
+
+/* Analyze one chor token stream into a ScnChor: display frames (resolved to
+ * uploaded cell textures), start sound (0xFFFD), and terminal opcode.
+ * Token layout (Wax_NextFrame@0x44ca00): [opcode][param][extras...]. */
+static void build_scn_chor(Renderer *r, const WaxSprite *sp,
+                           const char *tex_base, const WaxChor *ch,
+                           ScnChor *out) {
+    memset(out, 0, sizeof(*out));
+    out->sound_idx = -1;
+    out->end   = SCN_END_STOP;
+    out->dt_ms = (ch->rate > 0) ? (1000u / (u32)ch->rate) : 100u;
+
+    const u16 *seq = ch->seq;
+    u32 len = ch->seq_len;
+    for (u32 t = 0; t < len; t++) {
+        u16 tok = seq[t];
+        if (tok < 0x8000) {
+            /* Display frame: frame idx -> cell -> texture */
+            if (tok < sp->frame_count && out->nframes < SCN_MAX_FRAMES) {
+                u32 ci = sp->frames[tok].cell_idx;
+                if (ci < sp->cell_count && sp->cells[ci].pixels &&
+                    sp->cells[ci].width > 0 && sp->cells[ci].height > 0) {
+                    char fn[96];
+                    snprintf(fn, sizeof(fn), "%s_c%u", tex_base, ci);
+                    u32 tid = renderer_upload_texture(r, fn,
+                                                      sp->cells[ci].pixels,
+                                                      sp->cells[ci].width,
+                                                      sp->cells[ci].height);
+                    if (tid) {
+                        u32 n = out->nframes++;
+                        out->tex[n] = tid;
+                        out->fw[n]  = sp->cells[ci].width  * NWX_PIXEL_TO_WORLD;
+                        out->fh[n]  = sp->cells[ci].height * NWX_PIXEL_TO_WORLD;
+                    }
+                }
+            }
+            continue;
+        }
+        u16 param = (t + 1 < len) ? seq[t + 1] : 0;
+        t++;                                     /* consume param word */
+        switch (tok) {
+        case 0xFFFF: out->end = SCN_END_STOP;      return;
+        case 0xFFFE: out->end = SCN_END_LOOP;      return;
+        case 0xFFF8: out->end = SCN_END_TERMINATE; return;
+        case 0xFFF9: out->end = SCN_END_STOP;      return; /* pause/hold */
+        case 0xFFFC: {                             /* SETSTATE <chor> */
+            u16 st = (t + 1 < len) ? seq[t + 1] : 0; t++;
+            out->end = SCN_END_SETSTATE;
+            out->end_state = (u8)st;
+            return;
+        }
+        case 0xFFFD: {                             /* PLAYSOUND <sounds.lst idx> */
+            u16 sidx = (t + 1 < len) ? seq[t + 1] : 0; t++;
+            if (out->sound_idx < 0) out->sound_idx = (i32)sidx;
+            break;
+        }
+        case 0xFFFB: t += param; break;            /* CALLBACK, param extras */
+        case 0xFFFA:                               /* SETFRAME <pos> */
+        case 0xFFF7: t += 1; break;                /* PLAYSOUND2 */
+        default: break;                            /* FFF6/FFF5 show/hide etc. */
+        }
+    }
+}
+
+/* Set up the Inv_Object chor state machine for an entity, from its ITM.
+ * Returns true if the entity is chor-driven scenery. */
+static bool load_scenery(Entity *e, const Archives *arc, Renderer *r) {
+    char itm_name[96];
+    snprintf(itm_name, sizeof(itm_name), "%s.itm", e->type_name);
+    u32 sz = 0;
+    const u8 *data = archives_get(arc, itm_name, &sz);
+    if (!data || !sz) return false;
+
+    ItmFile itm;
+    if (!itm_parse(&itm, (const char *)data, sz)) return false;
+    if (strcasecmp(itm.func, "Inv_Object") != 0) return false;
+
+    /* TYPE field -> ray-solidity / reaction class (actor+0x78 semantics) */
+    const char *type = itm_get_str(&itm, "TYPE", NULL);
+    if (!type)                              e->scenery_type = SCENERY_PASS;
+    else if (strcasecmp(type, "SHOOT") == 0) e->scenery_type = SCENERY_SHOOT;
+    else                                     e->scenery_type = SCENERY_NUDGE;
+
+    /* Costume: ANIM field (fallback: class name). Strip the extension —
+     * load_entity_wax appends .nwx itself. */
+    char base[64];
+    if (itm.anim[0] && strcasecmp(itm.anim, "NULL") != 0)
+        snprintf(base, sizeof(base), "%s", itm.anim);
+    else
+        snprintf(base, sizeof(base), "%s", e->type_name);
+    char *dot = strrchr(base, '.');
+    if (dot) {
+        if (strcasecmp(dot, ".3do") == 0) return false; /* 3DO scenery: not chor-driven */
+        *dot = '\0';
+    }
+
+    char tex_base[72];
+    snprintf(tex_base, sizeof(tex_base), "%s.nwx", base);
+    for (char *p = tex_base; *p; p++) *p = tolower((unsigned char)*p);
+
+    WaxSprite sprite;
+    if (!load_entity_wax(base, arc, &sprite, tex_base)) return false;
+    if (sprite.chor_count == 0) { wax_free(&sprite); return false; }
+
+    e->scn_count = (sprite.chor_count < SCN_MAX_CHORS)
+                   ? sprite.chor_count : SCN_MAX_CHORS;
+    for (u32 c = 0; c < e->scn_count; c++)
+        build_scn_chor(r, &sprite, tex_base, &sprite.chors[c], &e->scn[c]);
+
+    /* Collision cylinder: ITM RADIUS/HEIGHT; non-positive values fall back
+     * to the WAX frame dimensions (Misc_CreateActorFromItem@0x472ab5). */
+    f32 radius = itm_get_float(&itm, "RADIUS", -1.0f);
+    f32 height = itm_get_float(&itm, "HEIGHT", -1.0f);
+    e->sprite_w = (radius > 0.0f) ? radius * 2.0f
+                                  : sprite.first_w * NWX_PIXEL_TO_WORLD;
+    e->sprite_h = (height > 0.0f) ? height
+                                  : sprite.first_h * NWX_PIXEL_TO_WORLD;
+
+    e->is_scenery  = true;
+    e->scn_state   = 0;     /* spawn state is always chor 0 */
+    e->scn_frame   = 0;
+    e->scn_timer   = 0.0f;
+    e->scn_playing = true;
+    e->anim_count  = 0;     /* disable the legacy cyclic-cells fallback */
+    wax_free(&sprite);
+    return true;
+}
+
 /*
  * Enemy costume choreography indices.
  *
@@ -1144,6 +1279,13 @@ bool world_load(World *world, Archives *arc,
                     e->render_w = nwx_w;
                     e->render_h = nwx_h;
                 }
+
+                /* Inv_Object scenery (bottles, lanterns, pots...): chor-driven
+                 * state machine — spawns in chor 0, breaks/reacts on hit or
+                 * nudge per its ITM TYPE. Replaces the cyclic-cells fallback
+                 * (which wrongly looped break animations). */
+                if (e->kind == ENTITY_DECORATION || e->kind == ENTITY_NONE)
+                    load_scenery(e, arc, r);
 
                 /* Load per-AI-state animation sequences for enemies */
                 if (e->kind == ENTITY_ENEMY) {

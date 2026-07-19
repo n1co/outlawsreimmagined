@@ -21,6 +21,8 @@
 #include "debug_ui.h"
 #include "menu.h"
 #include "savegame.h"
+#include "projectile.h"
+#include "tdo.h"
 
 #include <SDL2/SDL.h>
 #include <math.h>
@@ -106,6 +108,18 @@ typedef struct {
 
     /* Sound effect IDs (0 = not loaded) */
     u32   sfx_weapon[WEAPON_COUNT];  /* Weapon fire sounds */
+    u32   sfx_weapon_alt[WEAPON_COUNT]; /* FIRE_SOUND_2 (fan, jab, throw) */
+    u32   sfx_dry[WEAPON_COUNT];     /* NO_AMMO click sounds */
+    u32   sfx_reload_w[WEAPON_COUNT];/* RELOAD_SOUND per weapon */
+    u32   sfx_explode, sfx_fuse;     /* Dynamite */
+
+    /* Thrown projectiles (knife / dynamite) + explosion FX */
+    ProjectileSystem projectiles;
+    u32   tex_knife_proj, tex_tnt_proj;
+    f32   knife_pw, knife_ph, tnt_pw, tnt_ph;
+    u32   fx_boom[16]; u32 fx_boom_n; f32 fx_boom_dt, boom_w, boom_h;
+    int   tdo_knife, tdo_tnt;        /* 3DO models for thrown projectiles */
+    bool  lmb_prev, rmb_prev;        /* Fire button edge detection */
     u32   sfx_player_hurt;           /* Player takes damage */
     u32   sfx_player_land;           /* Player lands from jump */
     u32   sfx_enemy_shot;            /* Enemy fires at player */
@@ -473,18 +487,188 @@ static u32 sfx_load(const char *name) {
     return id;
 }
 
+/* sounds.lst (outlaws.lab): positional sound table for scenery chor
+ * PLAYSOUND events (Ghidra: loaded @0x429bd0 into DAT_00531480; chor opcode
+ * 0xFFFD carries an index into it). Format: header lines then
+ * "NUM  PRIORITY  NAME" rows. */
+#define MAX_LST_SOUNDS 64
+static u32 g_lst_sounds[MAX_LST_SOUNDS];
+
+static void load_sounds_lst(void) {
+    u32 sz = 0;
+    const u8 *data = archives_get(&g_app.archives, "sounds.lst", &sz);
+    if (!data || !sz) return;
+    char buf[4096];
+    u32 n = (sz < sizeof(buf) - 1) ? sz : sizeof(buf) - 1;
+    memcpy(buf, data, n); buf[n] = '\0';
+    char *save = NULL;
+    for (char *line = strtok_r(buf, "\r\n", &save); line;
+         line = strtok_r(NULL, "\r\n", &save)) {
+        int idx; char prio[8], wav[64];
+        if (sscanf(line, " %d %7s %63s", &idx, prio, wav) == 3 &&
+            idx >= 0 && idx < MAX_LST_SOUNDS && strstr(wav, "."))
+            g_lst_sounds[idx] = sfx_load(wav);
+    }
+}
+
+/* Scenery chor sound hook (entity_set_sfx_callback). */
+static void scenery_play_sfx(i32 sounds_lst_idx, Vec3 pos) {
+    (void)pos; /* TODO: positional attenuation */
+    if (sounds_lst_idx >= 0 && sounds_lst_idx < MAX_LST_SOUNDS &&
+        g_lst_sounds[sounds_lst_idx])
+        audio_play(&g_app.audio, g_lst_sounds[sounds_lst_idx]);
+}
+
 static void load_sfx(void) {
-    /* Weapon fire sounds (exact names from olsfx.lab) */
-    g_app.sfx_weapon[WEAPON_FIST]        = sfx_load("jab.wav");
+    /* Weapon fire sounds (ITM FIRE_SOUND_1/2 names, from olsfx.lab):
+     * fist: ACTION throw(whoosh) + FIRE connect(on hit only);
+     * sawed: FIRE_SOUND_1 sawed, _2 double; TNT: _1 null, _2 throw;
+     * knife: _1 throw, _2 jab. */
+    g_app.sfx_weapon[WEAPON_FIST]        = sfx_load("THROW.WAV");
     g_app.sfx_weapon[WEAPON_PISTOL]      = sfx_load("PISTOL.WAV");
     g_app.sfx_weapon[WEAPON_RIFLE]       = sfx_load("RIFLE.WAV");
     g_app.sfx_weapon[WEAPON_SHOTGUN]     = sfx_load("SINGLE.WAV");
     g_app.sfx_weapon[WEAPON_DBL_SHOTGUN] = sfx_load("DOUBLE.WAV");
-    g_app.sfx_weapon[WEAPON_SAW_GUN]     = sfx_load("sawblade.WAV");
-    g_app.sfx_weapon[WEAPON_DYNAMITE]    = sfx_load("DYNAMITE.WAV");
+    g_app.sfx_weapon[WEAPON_SAW_GUN]     = sfx_load("SAWED.WAV");
+    g_app.sfx_weapon[WEAPON_DYNAMITE]    = 0;             /* FIRE_SOUND_1 null */
     g_app.sfx_weapon[WEAPON_KNIFE]       = sfx_load("THROW.WAV");
     g_app.sfx_weapon[WEAPON_GATLING]     = sfx_load("GatlShot.WAV");
 
+    g_app.sfx_weapon_alt[WEAPON_FIST]        = sfx_load("connect.wav");
+    g_app.sfx_weapon_alt[WEAPON_PISTOL]      = g_app.sfx_weapon[WEAPON_PISTOL];
+    g_app.sfx_weapon_alt[WEAPON_RIFLE]       = g_app.sfx_weapon[WEAPON_RIFLE];
+    g_app.sfx_weapon_alt[WEAPON_SHOTGUN]     = g_app.sfx_weapon[WEAPON_SHOTGUN];
+    g_app.sfx_weapon_alt[WEAPON_DBL_SHOTGUN] = g_app.sfx_weapon[WEAPON_DBL_SHOTGUN];
+    g_app.sfx_weapon_alt[WEAPON_SAW_GUN]     = sfx_load("DOUBLE.WAV");
+    g_app.sfx_weapon_alt[WEAPON_DYNAMITE]    = sfx_load("THROW.WAV");
+    g_app.sfx_weapon_alt[WEAPON_KNIFE]       = sfx_load("jab.wav");
+    g_app.sfx_weapon_alt[WEAPON_GATLING]     = g_app.sfx_weapon[WEAPON_GATLING];
+
+    /* Dry-fire clicks (NO_AMMO_SOUND) and per-round reload sounds */
+    g_app.sfx_dry[WEAPON_PISTOL]       = sfx_load("pistout.wav");
+    g_app.sfx_dry[WEAPON_RIFLE]        = sfx_load("rifleout.wav");
+    g_app.sfx_dry[WEAPON_SHOTGUN]      = sfx_load("shotout.wav");
+    g_app.sfx_dry[WEAPON_DBL_SHOTGUN]  = g_app.sfx_dry[WEAPON_SHOTGUN];
+    g_app.sfx_dry[WEAPON_SAW_GUN]      = g_app.sfx_dry[WEAPON_SHOTGUN];
+    g_app.sfx_dry[WEAPON_GATLING]      = sfx_load("gatLTAIL.wav");
+    g_app.sfx_reload_w[WEAPON_PISTOL]      = sfx_load("preload.wav");
+    g_app.sfx_reload_w[WEAPON_RIFLE]       = sfx_load("rreload.wav");
+    g_app.sfx_reload_w[WEAPON_SHOTGUN]     = sfx_load("sreload.wav");
+    g_app.sfx_reload_w[WEAPON_DBL_SHOTGUN] = g_app.sfx_reload_w[WEAPON_SHOTGUN];
+    g_app.sfx_reload_w[WEAPON_SAW_GUN]     = g_app.sfx_reload_w[WEAPON_SHOTGUN];
+    g_app.sfx_reload_w[WEAPON_GATLING]     = sfx_load("weapgrab.WAV");
+
+    g_app.sfx_explode = sfx_load("explode.wav");
+    g_app.sfx_fuse    = sfx_load("fuse.wav");
+}
+
+static void proj_on_explode(Vec3 pos);
+static void proj_play_sfx(const char *name, Vec3 pos);
+
+/* Upload the direction-0 cell of an NWX as a texture (projectile billboards).
+ * 0.0583 = NWX pixel → world unit (calibrated, see world.c). */
+static u32 load_wax_cell_tex(const char *nwx_name, const char *tex_name,
+                             f32 *out_w, f32 *out_h) {
+    u32 sz = 0;
+    const u8 *data = archives_get(&g_app.archives, nwx_name, &sz);
+    if (!data || !sz) return 0;
+    static WaxSprite sp;
+    if (!wax_decode(&sp, data, sz,
+                    g_app.archives.palette_loaded ? g_app.archives.palette : NULL))
+        return 0;
+    u32 tid = 0;
+    u32 ci = sp.dir_cell[0];
+    if (ci < sp.cell_count && sp.cells[ci].pixels) {
+        tid = renderer_upload_texture(&g_app.renderer, tex_name,
+                                      sp.cells[ci].pixels,
+                                      sp.cells[ci].width, sp.cells[ci].height);
+        if (out_w) *out_w = sp.cells[ci].width  * 0.0583f;
+        if (out_h) *out_h = sp.cells[ci].height * 0.0583f;
+    }
+    wax_free(&sp);
+    return tid;
+}
+
+/* Projectile visuals: knife/dynamite billboards + TNTBOOM explosion frames.
+ * The world-object 3DOs (gknife/gdynam) are untextured models; we use the
+ * weapon NWX ammo-cartridge cells (chor 11) already loaded by the renderer —
+ * a bare dynamite stick / knife image — as billboards. */
+static void load_projectile_assets(void) {
+    Renderer *r = &g_app.renderer;
+
+    g_app.tex_knife_proj = r->weapon_ammo_tex[WEAPON_KNIFE];
+    if (!g_app.tex_knife_proj)
+        g_app.tex_knife_proj = load_wax_cell_tex("ijknife.nwx", "proj_knife",
+                                                 &g_app.knife_pw, &g_app.knife_ph);
+    if (g_app.tex_knife_proj && g_app.tex_knife_proj <= r->texture_count) {
+        g_app.knife_pw = r->textures[g_app.tex_knife_proj-1].width  * 0.0583f;
+        g_app.knife_ph = r->textures[g_app.tex_knife_proj-1].height * 0.0583f;
+    }
+    if (g_app.knife_pw > 2.5f) { g_app.knife_ph *= 2.5f / g_app.knife_pw; g_app.knife_pw = 2.5f; }
+
+    g_app.tex_tnt_proj = r->weapon_ammo_tex[WEAPON_DYNAMITE];
+    if (!g_app.tex_tnt_proj)
+        g_app.tex_tnt_proj = load_wax_cell_tex("ijdynam.nwx", "proj_tnt",
+                                               &g_app.tnt_pw, &g_app.tnt_ph);
+    if (g_app.tex_tnt_proj && g_app.tex_tnt_proj <= r->texture_count) {
+        g_app.tnt_pw = r->textures[g_app.tex_tnt_proj-1].width  * 0.0583f;
+        g_app.tnt_ph = r->textures[g_app.tex_tnt_proj-1].height * 0.0583f;
+    }
+    if (g_app.tnt_pw > 2.0f) { g_app.tnt_ph *= 2.0f / g_app.tnt_pw; g_app.tnt_pw = 2.0f; }
+    OL_LOG("Projectile sprites: knife tex=%u (%.1fx%.1f) tnt tex=%u (%.1fx%.1f)\n",
+           g_app.tex_knife_proj, g_app.knife_pw, g_app.knife_ph,
+           g_app.tex_tnt_proj, g_app.tnt_pw, g_app.tnt_ph);
+
+    /* Ground-object 3DO models (the original renders thrown knives and
+     * dynamite as flat-shaded palette-colored models — gknife/gdynam.3do). */
+    if (g_app.tdo_knife == 0 && g_app.tdo_tnt == 0) {   /* load once */
+        g_app.tdo_knife = g_app.tdo_tnt = -1;
+        const char *names[2] = { "gknife.3do", "gdynam.3do" };
+        int *slots[2] = { &g_app.tdo_knife, &g_app.tdo_tnt };
+        for (int i = 0; i < 2; i++) {
+            u32 sz = 0;
+            const u8 *data = archives_get(&g_app.archives, names[i], &sz);
+            if (!data || !sz) continue;
+            static TdoModel model;
+            if (tdo_parse(&model, (const char *)data, sz)) {
+                *slots[i] = renderer_upload_tdo(&g_app.renderer, &model,
+                    g_app.archives.palette_loaded ? g_app.archives.palette : NULL);
+            }
+        }
+        OL_LOG("Projectile 3DOs: knife=%d tnt=%d\n", g_app.tdo_knife, g_app.tdo_tnt);
+    }
+
+    /* TNTBOOM.NWX (olobj.lab): explosion animation frames */
+    u32 sz = 0;
+    const u8 *data = archives_get(&g_app.archives, "TNTBOOM.NWX", &sz);
+    if (data && sz) {
+        static WaxSprite sp;
+        if (wax_decode(&sp, data, sz,
+                       g_app.archives.palette_loaded ? g_app.archives.palette : NULL)) {
+            g_app.fx_boom_n = 0;
+            for (u32 c = 0; c < sp.cell_count && g_app.fx_boom_n < 16; c++) {
+                if (!sp.cells[c].pixels) continue;
+                char tn[32]; snprintf(tn, sizeof(tn), "fx_boom_%u", c);
+                u32 t = renderer_upload_texture(&g_app.renderer, tn,
+                                                sp.cells[c].pixels,
+                                                sp.cells[c].width, sp.cells[c].height);
+                if (t) {
+                    if (g_app.fx_boom_n == 0) {
+                        g_app.boom_w = sp.cells[c].width  * 0.0583f * 2.0f;
+                        g_app.boom_h = sp.cells[c].height * 0.0583f * 2.0f;
+                    }
+                    g_app.fx_boom[g_app.fx_boom_n++] = t;
+                }
+            }
+            g_app.fx_boom_dt = 0.07f;
+            wax_free(&sp);
+            OL_LOG("Explosion FX: %u frames\n", g_app.fx_boom_n);
+        }
+    }
+}
+
+/* Player/world sound effects (second half of SFX loading). */
+static void load_sfx_rest(void) {
     /* Player sounds */
     g_app.sfx_player_hurt = sfx_load("gotshot.wav");
     g_app.sfx_player_land = sfx_load("LAND.WAV");
@@ -654,6 +838,10 @@ static bool load_level_runtime(const char *name) {
     setup_inf_sounds();
     memset(g_app.renderer.sector_scroll_u, 0, sizeof(g_app.renderer.sector_scroll_u));
     memset(g_app.renderer.sector_scroll_v, 0, sizeof(g_app.renderer.sector_scroll_v));
+
+    /* Projectile billboards/FX need the level palette (built by world_load) */
+    load_projectile_assets();
+    projectile_init(&g_app.projectiles);   /* clear stale projectiles */
 
     player_init(&g_app.player, g_app.world.player_start);
     g_app.player.yaw        = g_app.world.player_start_yaw;
@@ -1054,6 +1242,13 @@ static bool app_init(int argc, char **argv) {
 
     /* Global (level-independent) sound effects. */
     load_sfx();
+    load_sfx_rest();
+    load_sounds_lst();
+    entity_set_sfx_callback(scenery_play_sfx);
+    projectile_init(&g_app.projectiles);
+    g_app.projectiles.on_explode = proj_on_explode;
+    g_app.projectiles.play_sfx   = proj_play_sfx;
+    /* Projectile sprites need the level palette: loaded in load_level_runtime */
 
     /* Front-end menu. Start at the menu unless a level was given on the command
      * line (dev / --check), in which case go straight into that level. */
@@ -1160,52 +1355,333 @@ static void fire_shoot_triggers(Vec3 eye, Vec3 dir) {
     }
 }
 
-static void do_player_shoot(void) {
+/* Uniform random in [0,1) */
+static f32 frand01(void) { return (f32)rand() / ((f32)RAND_MAX + 1.0f); }
+
+/* Trigger the view-model fire animation for the current weapon. */
+static void start_fire_anim(int mode) {
+    g_app.player.fire_anim = true;
+    g_app.player.fire_alt = (mode == 1);
+    g_app.player.fire_anim_timer = 0.0f;
+    int wi = (int)g_app.player.weapons.current;
+    u32 total_ms = 0;
+    if (mode == 1) {
+        for (u32 f = 0; f < g_app.renderer.weapon_fire2_frame_count[wi]; f++)
+            total_ms += g_app.renderer.weapon_fire2_dt[wi][f];
+    } else {
+        for (u32 f = 0; f < g_app.renderer.weapon_fire_frame_count[wi]; f++)
+            total_ms += g_app.renderer.weapon_fire_dt[wi][f];
+    }
+    g_app.player.fire_anim_dur = total_ms > 0 ? (f32)total_ms / 1000.0f : 0.25f;
+}
+
+/* One hitscan trace with the exact shot semantics (Weapon_FireTick@0x471090 /
+ * Shot_Execute@0x458050): per-shot damage roll ±10%, aim error, distance roll;
+ * targets = entities AND resting ground dynamite (shot detonates it). */
+static void fire_one_trace(Vec3 eye, f32 yaw, f32 pitch, f32 max_dist,
+                           f32 dmg, bool play_hit_snd) {
+    f32 cp = cosf(pitch), sp = sinf(pitch);
+    Vec3 dir = { cosf(yaw)*cp, sp, sinf(yaw)*cp };
+
+    break_glass_windows(eye, dir);
+    fire_shoot_triggers(eye, dir);
+
+    f32 de, dp;
+    int ei = entity_raycast(&g_app.world.entities, &g_app.world.lvt,
+                            eye, dir, max_dist, &de);
+    int pi = projectile_raycast(&g_app.projectiles, eye, dir, max_dist, &dp);
+    if (pi >= 0 && (ei < 0 || dp < de)) {
+        projectile_damage(&g_app.projectiles, pi);   /* ground dynamite! */
+        return;
+    }
+    if (ei >= 0) {
+        const Entity *e = &g_app.world.entities.entities[ei];
+        i32 idmg = (i32)(dmg + 0.5f);
+        if (idmg < 1) idmg = 1;
+        bool died = entity_damage(&g_app.world.entities, ei, idmg);
+        if (play_hit_snd)
+            audio_play(&g_app.audio, died ? e->sfx_die : e->sfx_hit);
+    }
+}
+
+/* Rolled max trace length (skipped when scoped → full RANGE):
+ * 1-in-8: 0.5·EFF + rand·0.5·EFF; else EFF + rand·(RANGE−EFF). */
+static f32 roll_max_dist(f32 eff, f32 range) {
+    if ((rand() & 7) == 0)
+        return 0.5f * eff + frand01() * 0.5f * eff;
+    return eff + frand01() * (range - eff);
+}
+
+/* Melee strike (Weapon_MeleeStrike @0x470d60): THREE hitscan traces at
+ * yaw −S, 0, +S (S = SPREAD arc), each with the distance roll. */
+static void do_melee(int mode) {
     const WeaponDef *def = &g_weapon_defs[g_app.player.weapons.current];
     Vec3 eye = player_eye_pos(&g_app.player);
+    f32 dmg_base = mode ? def->damage_2 : def->damage_1;
+    f32 S   = (mode ? def->spread_2 : def->spread_1) * OL_DEG2RAD;
+    f32 eff = mode ? def->effrange_2 : def->effrange_1;
+    f32 rng = mode ? def->range_2 : def->range_1;
+    f32 offs[3] = { -S, 0.0f, S };
+    for (int i = 0; i < 3; i++) {
+        f32 dmg = dmg_base * (0.9f + frand01() * 0.2f);
+        fire_one_trace(eye, g_app.player.yaw + offs[i], g_app.player.pitch,
+                       roll_max_dist(eff, rng), dmg, i == 1);
+    }
+}
 
-    /* Play weapon fire sound */
-    audio_play(&g_app.audio, g_app.sfx_weapon[g_app.player.weapons.current]);
+/* Full ranged fire for the current weapon in `mode` (0/1).
+ * DB/sawed-off primary consumes 2 rounds = both barrels (2× pellets). */
+static void do_player_fire(int mode) {
+    WeaponState *ws = &g_app.player.weapons;
+    const WeaponDef *def = &g_weapon_defs[ws->current];
 
-    /* Build GL-space shoot direction (same as camera forward) */
-    f32 cp = cosf(g_app.player.pitch), sp = sinf(g_app.player.pitch);
-    f32 cy = cosf(g_app.player.yaw),   sy = sinf(g_app.player.yaw);
-    Vec3 dir = { cy*cp, sp, sy*cp };  /* LVT-space direction */
+    i32 rounds = 1;
+    if ((ws->current == WEAPON_DBL_SHOTGUN || ws->current == WEAPON_SAW_GUN) &&
+        mode == 0)
+        rounds = 2;
 
-    /* Melee weapons: short range, no raycast needed */
-    if (def->melee) {
-        f32 dist;
-        int idx = entity_raycast(&g_app.world.entities, &g_app.world.lvt, eye, dir,
-                                 def->range_2, &dist);
-        if (idx >= 0) {
-            const Entity *e = &g_app.world.entities.entities[idx];
-            bool died = entity_damage(&g_app.world.entities, idx, def->damage_1);
-            audio_play(&g_app.audio, died ? e->sfx_die : e->sfx_hit);
+    i32 fired = weapon_consume(ws, rounds, mode);
+    if (fired <= 0) return;
+
+    u32 snd = mode ? g_app.sfx_weapon_alt[ws->current]
+                   : g_app.sfx_weapon[ws->current];
+    if (snd) audio_play(&g_app.audio, snd);
+    start_fire_anim(mode);
+
+    if (def->melee) { do_melee(mode); return; }
+
+    Vec3 eye = player_eye_pos(&g_app.player);
+    bool scoped = ws->scope_active;
+    f32 dmg_base = mode ? def->damage_2   : def->damage_1;
+    f32 spread   = mode ? def->spread_2   : def->spread_1;
+    f32 eff      = mode ? def->effrange_2 : def->effrange_1;
+    f32 rng      = mode ? def->range_2    : def->range_1;
+    /* Aim error grows when hurt: Veff = VARIANCE + (100−health)·0.05 deg */
+    f32 var = (mode ? def->variance_2 : def->variance_1)
+              + (100.0f - (f32)g_app.player.health) * 0.05f;
+
+    for (i32 s = 0; s < fired; s++) {
+        for (i32 p = 0; p < def->pellets; p++) {
+            f32 yaw   = g_app.player.yaw;
+            f32 pitch = g_app.player.pitch;
+            if (!scoped) {
+                yaw   += (frand01() * 2.0f - 1.0f) * var * OL_DEG2RAD;
+                pitch += (frand01() * 2.0f - 1.0f) * var * OL_DEG2RAD;
+            }
+            if (spread > 0.0f) {
+                yaw   += (frand01() * 2.0f - 1.0f) * spread * OL_DEG2RAD;
+                pitch += (frand01() * 2.0f - 1.0f) * spread * OL_DEG2RAD;
+            }
+            f32 dist = scoped ? rng : roll_max_dist(eff, rng);
+            f32 dmg  = dmg_base * (0.9f + frand01() * 0.2f);
+            fire_one_trace(eye, yaw, pitch, dist, dmg, s == 0 && p == 0);
+        }
+    }
+}
+
+/* -------------------------------------------------------------------------
+ * Explosion (pdynam): people RADIUS 50 / DAMAGE 12 with LOS + quadratic
+ * falloff (Explosion_DamageObject @0x45a270); concussion advances scenery;
+ * WALL_RADIUS 15 breaks windows and fires wall INF triggers.
+ * ---------------------------------------------------------------------- */
+static void explosion_at(Vec3 pos) {
+    const LvtLevel *lvt = &g_app.world.lvt;
+
+    /* Visual + spawn FX */
+    if (g_app.fx_boom_n)
+        projectile_spawn_fx(&g_app.projectiles,
+                            (Vec3){ pos.x, pos.y - g_app.boom_h * 0.3f, pos.z },
+                            g_app.fx_boom, g_app.fx_boom_n, g_app.fx_boom_dt,
+                            g_app.boom_w, g_app.boom_h);
+
+    /* Entities (enemies): LOS + falloff */
+    EntityList *el = &g_app.world.entities;
+    for (u32 i = 0; i < el->count; i++) {
+        Entity *e = &el->entities[i];
+        if (!e->active) continue;
+        if (e->kind != ENTITY_ENEMY && !e->is_scenery) continue;
+        Vec3 c = { e->pos.x, e->pos.y + e->sprite_h * 0.5f, e->pos.z };
+        f32 dx = c.x - pos.x, dy = c.y - pos.y, dz = c.z - pos.z;
+        f32 d = sqrtf(dx*dx + dy*dy + dz*dz);
+        if (d > PROJ_TNT_BLAST_R) continue;
+        if (!collision_has_los(lvt, pos.x, pos.z, pos.y, c.x, c.z, c.y))
+            continue;
+        f32 f = (d <= 0.25f * PROJ_TNT_BLAST_R) ? 1.0f
+                : ((PROJ_TNT_BLAST_R - d) / (0.75f * PROJ_TNT_BLAST_R));
+        if (f < 0.0f) f = 0.0f;
+        f *= f;   /* quadratic falloff */
+        i32 dmg = (i32)(PROJ_TNT_DMG * f * (0.9f + frand01() * 0.2f) + 0.5f);
+        if (dmg > 0) entity_damage(el, (int)i, dmg);
+    }
+
+    /* Player */
+    {
+        Vec3 pc = player_eye_pos(&g_app.player);
+        f32 dx = pc.x - pos.x, dy = pc.y - pos.y, dz = pc.z - pos.z;
+        f32 d = sqrtf(dx*dx + dy*dy + dz*dz);
+        if (d <= PROJ_TNT_BLAST_R &&
+            collision_has_los(lvt, pos.x, pos.z, pos.y, pc.x, pc.z, pc.y)) {
+            f32 f = (d <= 0.25f * PROJ_TNT_BLAST_R) ? 1.0f
+                    : ((PROJ_TNT_BLAST_R - d) / (0.75f * PROJ_TNT_BLAST_R));
+            if (f < 0.0f) f = 0.0f;
+            f *= f;
+            i32 dmg = (i32)(PROJ_TNT_DMG * f * (0.9f + frand01() * 0.2f) + 0.5f);
+            if (dmg > 0) player_damage(&g_app.player, dmg);
+        }
+    }
+
+    /* Concussion (msg 0x7D3): nudge scenery in the blast (no direction). */
+    entity_nudge(el, pos, (Vec3){0,0,0}, PROJ_TNT_BLAST_R);
+
+    /* WALL_RADIUS 15: break glass windows + wall INF SHOOT triggers */
+    for (u32 si = 0; si < lvt->sector_count; si++) {
+        LvtSector *sec = (LvtSector *)&lvt->sectors[si];
+        for (u32 wi = 0; wi < sec->wall_count; wi++) {
+            LvtWall *w = &sec->walls[wi];
+            if (!w->is_window || w->window_broken) continue;
+            if (w->v1 < 0 || w->v2 < 0) continue;
+            f32 mx = (sec->vertices[w->v1].x + sec->vertices[w->v2].x) * 0.5f;
+            f32 mz = (sec->vertices[w->v1].y + sec->vertices[w->v2].y) * 0.5f;
+            f32 dx = mx - pos.x, dz = mz - pos.z;
+            if (dx*dx + dz*dz > PROJ_TNT_WALL_R * PROJ_TNT_WALL_R) continue;
+            w->window_broken = true;
+            if (g_app.sfx_glass_break) audio_play(&g_app.audio, g_app.sfx_glass_break);
+        }
+    }
+    {
+        int si = collision_find_sector(lvt, pos.x, pos.z, 0);
+        if (si >= 0 && si < (i32)lvt->sector_count) {
+            inf_fire_triggers(&g_app.world.inf, (u32)si, INF_EVENT_SHOOT);
+            const LvtSector *sec = &lvt->sectors[si];
+            for (u32 wi = 0; wi < sec->wall_count; wi++) {
+                i32 adj = sec->walls[wi].adjoin;
+                if (adj >= 0 && adj < (i32)lvt->sector_count)
+                    inf_fire_triggers(&g_app.world.inf, (u32)adj, INF_EVENT_SHOOT);
+            }
+        }
+    }
+    /* Rebuild geometry if windows broke */
+    renderer_build_level(&g_app.renderer, &g_app.world.lvt, &g_app.world.inf);
+}
+
+static void proj_on_explode(Vec3 pos) { explosion_at(pos); }
+static void proj_play_sfx(const char *name, Vec3 pos) {
+    (void)pos;
+    if (strcmp(name, "explode") == 0 && g_app.sfx_explode)
+        audio_play(&g_app.audio, g_app.sfx_explode);
+    else if (strcmp(name, "fuse") == 0 && g_app.sfx_fuse)
+        audio_play(&g_app.audio, g_app.sfx_fuse);
+}
+
+/* Throw a projectile from the player's hands (y + 0.85·height, inherits
+ * the player velocity; power = clamp(heldSeconds, 0.5, 1.0)). */
+static void player_throw(ProjKind kind, f32 power, bool lit, f32 fuse) {
+    Player *pl = &g_app.player;
+    Vec3 origin = { pl->pos.x,
+                    pl->pos.y + 0.85f * player_collision_height(pl),
+                    pl->pos.z };
+    Vec3 inherit = { pl->vel.x, 0.0f, pl->vel.z };
+    Projectile *p = projectile_throw(&g_app.projectiles, kind, origin,
+                                     pl->yaw, pl->pitch, inherit,
+                                     power, lit, fuse);
+    if (p) {
+        if (kind == PROJ_KNIFE) {
+            p->tdo = g_app.tdo_knife;
+            p->tex = g_app.tex_knife_proj; p->w = g_app.knife_pw; p->h = g_app.knife_ph;
+        } else {
+            p->tdo = g_app.tdo_tnt;
+            p->tex = g_app.tex_tnt_proj; p->w = g_app.tnt_pw; p->h = g_app.tnt_ph;
+        }
+        if (p->tdo >= 0) p->tex = 0;   /* model instead of billboard */
+    }
+}
+
+/* Thrown-weapon input (knife & dynamite; button tables + cook mechanics —
+ * Weapon_KnifeHandler @0x46d970, Weapon_TNTHandler @0x46d440). */
+static void handle_thrown_weapon(bool lmb_press, bool lmb_held,
+                                 bool rmb_press, f32 dt) {
+    WeaponState *ws = &g_app.player.weapons;
+
+    if (ws->current == WEAPON_KNIFE) {
+        /* LMB = throw (cooked 0.5–1.0), RMB = jab (free melee) */
+        if (lmb_press && !ws->cooking && ws->fire_cooldown <= 0.0f &&
+            ws->ammo[WEAPON_KNIFE] > 0) {
+            ws->cooking = true;
+            ws->cook_time = 0.0f;
+        }
+        if (ws->cooking) {
+            if (lmb_held) {
+                ws->cook_time += dt;
+            } else {
+                f32 power = OL_CLAMP(ws->cook_time, 0.5f, 1.0f);
+                ws->cooking = false;
+                if (ws->ammo[WEAPON_KNIFE] > 0) {
+                    ws->ammo[WEAPON_KNIFE]--;
+                    player_throw(PROJ_KNIFE, power, false, 0.0f);
+                    audio_play(&g_app.audio, g_app.sfx_weapon[WEAPON_KNIFE]);
+                    start_fire_anim(0);
+                    ws->fire_cooldown = 0.5f;
+                    if (ws->ammo[WEAPON_KNIFE] <= 0)
+                        weapon_cycle_next(ws);   /* out of knives → switch */
+                }
+            }
+        }
+        if (rmb_press && ws->fire_cooldown <= 0.0f) {
+            audio_play(&g_app.audio, g_app.sfx_weapon_alt[WEAPON_KNIFE]);
+            start_fire_anim(1);
+            do_melee(1);
+            ws->fire_cooldown = 0.5f;
         }
         return;
     }
 
-    /* Ranged weapons: shatter any glass window along the aim, then hit-scan. */
-    break_glass_windows(eye, dir);
-    fire_shoot_triggers(eye, dir);
-    for (int p = 0; p < def->pellets; p++) {
-        Vec3 shot_dir = dir;
-        if (def->spread_1 > 0.0f && p > 0) {
-            /* Randomize direction within spread cone */
-            f32 sx = ((f32)(rand() % 200) - 100) / 100.0f * def->spread_1;
-            f32 sy2 = ((f32)(rand() % 200) - 100) / 100.0f * def->spread_1;
-            shot_dir.x += sx; shot_dir.y += sy2;
-            shot_dir = vec3_norm(shot_dir);
+    /* DYNAMITE — INVERTED buttons: LMB = throw (mode 1), RMB = light (mode 0) */
+    if (rmb_press && !ws->holding_lit && ws->fire_cooldown <= 0.0f &&
+        ws->ammo[WEAPON_DYNAMITE] > 0) {
+        ws->ammo[WEAPON_DYNAMITE]--;
+        ws->holding_lit = true;
+        ws->lit_fuse = PROJ_TNT_FUSE;   /* 4.5 s from LIGHTING */
+        if (g_app.sfx_fuse) audio_play(&g_app.audio, g_app.sfx_fuse);
+        start_fire_anim(0);             /* FIRE_CHOR_1 = light animation */
+        ws->fire_cooldown = 0.4f;
+    }
+    /* A held lit stick keeps burning — and explodes in your hand. */
+    if (ws->holding_lit) {
+        ws->lit_fuse -= dt;
+        if (ws->lit_fuse <= 0.0f) {
+            ws->holding_lit = false;
+            ws->cooking = false;
+            if (g_app.sfx_explode) audio_play(&g_app.audio, g_app.sfx_explode);
+            explosion_at(g_app.player.pos);
+            projectile_chain(&g_app.projectiles, g_app.player.pos, PROJ_TNT_BLAST_R);
         }
-        f32 dist;
-        int idx = entity_raycast(&g_app.world.entities, &g_app.world.lvt, eye, shot_dir,
-                                 8192.0f, &dist);
-        if (idx >= 0) {
-            const Entity *e = &g_app.world.entities.entities[idx];
-            bool died = entity_damage(&g_app.world.entities, idx, def->damage_1);
-            /* Play hit/die sound (only once per shot, for first pellet hit) */
-            if (p == 0)
-                audio_play(&g_app.audio, died ? e->sfx_die : e->sfx_hit);
+    }
+    if (lmb_press && !ws->cooking && ws->fire_cooldown <= 0.0f &&
+        (ws->holding_lit || ws->ammo[WEAPON_DYNAMITE] > 0)) {
+        ws->cooking = true;
+        ws->cook_time = 0.0f;
+    }
+    if (ws->cooking) {
+        if (lmb_held) {
+            ws->cook_time += dt;
+        } else {
+            f32 power = OL_CLAMP(ws->cook_time, 0.5f, 1.0f);
+            ws->cooking = false;
+            if (ws->holding_lit) {
+                /* Throw the lit stick — the fuse keeps its remaining time */
+                player_throw(PROJ_DYNAMITE, power, true, ws->lit_fuse);
+                ws->holding_lit = false;
+            } else if (ws->ammo[WEAPON_DYNAMITE] > 0) {
+                ws->ammo[WEAPON_DYNAMITE]--;
+                player_throw(PROJ_DYNAMITE, power, false, 0.0f);
+            } else {
+                return;
+            }
+            audio_play(&g_app.audio, g_app.sfx_weapon_alt[WEAPON_DYNAMITE]);
+            start_fire_anim(1);
+            ws->fire_cooldown = 0.6f;
+            if (ws->ammo[WEAPON_DYNAMITE] <= 0 && !ws->holding_lit)
+                weapon_cycle_next(ws);
         }
     }
 }
@@ -1361,7 +1837,12 @@ static void app_run(void) {
          * a neutral (zeroed) input so the player is frozen. */
         static const InputState s_null_input = {0};
         const InputState *game_input = g_debug.visible ? &s_null_input : &g_app.input;
-        bool fired = player_update(&g_app.player, game_input, dt);
+        /* Current sector's LVT friction (default 1.0) for the movement model */
+        f32 sec_friction = 1.0f;
+        if (g_app.player.sector_idx >= 0 &&
+            g_app.player.sector_idx < (i32)g_app.world.lvt.sector_count)
+            sec_friction = g_app.world.lvt.sectors[g_app.player.sector_idx].friction;
+        bool fired = player_update(&g_app.player, game_input, dt, sec_friction);
         if (g_app.force_crouch) { /* debug: force the crouch eye height */
             g_app.player.crouching = true;
             g_app.player.eye_height = PLAYER_CROUCH_EYE;
@@ -1375,6 +1856,18 @@ static void app_run(void) {
             else g_app.player.pos.y += 1.0f; /* small margin; gravity settles to floor */
             g_app.player.yaw = g_app.spawn_yaw_deg * OL_DEG2RAD;
             if (getenv("OL_PITCH")) g_app.player.pitch = (f32)atof(getenv("OL_PITCH")) * OL_DEG2RAD;
+            if (getenv("OL_TNTDROP")) { /* debug: toss a dynamite + knife ahead */
+                g_app.player.weapons.has_weapon[WEAPON_DYNAMITE] = true;
+                weapon_add_ammo(&g_app.player.weapons, WEAPON_DYNAMITE, 5);
+                player_throw(PROJ_DYNAMITE, 0.5f, false, 0.0f);
+                player_throw(PROJ_KNIFE, 0.6f, false, 0.0f);
+            }
+            if (getenv("OL_SCOPE")) { /* debug: force rifle + scope view */
+                g_app.player.weapons.has_weapon[WEAPON_RIFLE] = true;
+                weapon_switch(&g_app.player.weapons, WEAPON_RIFLE);
+                g_app.player.weapons.scope_active = true;
+                renderer_set_zoom(&g_app.renderer, 2.0f);
+            }
             g_app.player.sector_idx = collision_find_sector_y(
                 &g_app.world.lvt, g_app.player.pos.x, g_app.player.pos.z,
                 g_app.player.pos.y, PLAYER_BODY_HEIGHT, -1);
@@ -1434,47 +1927,89 @@ static void app_run(void) {
         /* ---- Collision detection ---- */
         {
             if (!g_debug.noclip) {
-            /* Resolve new position (post-movement) against level walls.
-             * from = pre-movement pos, to = post-movement pos. */
+            Player *pl = &g_app.player;
+
+            /* Resolve new position against level walls using the CURRENT
+             * collision height (eye + HEAD_HEIGHT): standing 6.0, crouched
+             * 2.0 — the crouch-aware fit test is what lets the player crawl
+             * under low floors (Sector_CanFitRecursive @0x4e6660). */
+            f32 col_h = player_collision_height(pl);
             Vec3 resolved = collision_resolve(
-                &g_app.world.lvt, pre_move_pos, g_app.player.pos,
-                PLAYER_RADIUS, PLAYER_BODY_HEIGHT, &g_app.player.sector_idx);
-            g_app.player.pos.x = resolved.x;
-            g_app.player.pos.z = resolved.z;
+                &g_app.world.lvt, pre_move_pos, pl->pos,
+                PLAYER_RADIUS, col_h, &pl->sector_idx);
+            pl->pos.x = resolved.x;
+            pl->pos.z = resolved.z;
 
-            /* Floor / ceiling */
+            /* Floor / ceiling + per-sector gravity */
             f32 floor_y = 0, ceil_y = 256;
-            collision_heights(&g_app.world.lvt, g_app.player.sector_idx,
-                              g_app.player.pos.x, g_app.player.pos.z,
-                              &floor_y, &ceil_y);
+            collision_heights(&g_app.world.lvt, pl->sector_idx,
+                              pl->pos.x, pl->pos.z, &floor_y, &ceil_y);
+            f32 sec_gravity = -60.0f;   /* LVT GRAVITY default */
+            if (pl->sector_idx >= 0 &&
+                pl->sector_idx < (i32)g_app.world.lvt.sector_count)
+                sec_gravity = g_app.world.lvt.sectors[pl->sector_idx].gravity;
 
-            /* Gravity: snap to floor */
-            if (g_app.player.pos.y <= floor_y) {
-                g_app.player.pos.y = floor_y;
-                /* Landing sound: was airborne, now on ground */
-                if (g_app.was_airborne)
-                    audio_play(&g_app.audio, g_app.sfx_player_land);
-                g_app.player.vel_y = 0.0f;
-                g_app.player.on_ground = true;
-                g_app.was_airborne = false;
-            } else {
-                g_app.player.on_ground = false;
+            /* Headroom limit for standing up (@0x4431f0):
+             * maxEye = min(HEIGHT, ceil-floor) - HEAD_HEIGHT. */
+            pl->max_eye = OL_MIN(PLAYER_BODY_HEIGHT, ceil_y - floor_y)
+                          - PLAYER_HEAD_HEIGHT;
+
+            /* Vertical physics (Physics_ApplyGravityStep @0x4e05e0): gravity
+             * applies only when the feet are more than STEP_HEIGHT above the
+             * floor or already moving vertically; within the band the player
+             * is grounded and snapped (stairs don't enter fall state). */
+            bool in_band = (pl->pos.y - floor_y) <= PHY_STEP_HEIGHT;
+            if (!in_band || pl->vel_y > 0.0f) {
+                pl->vel_y += sec_gravity * dt;
+                pl->pos.y += pl->vel_y * dt;
+                pl->on_ground = false;
                 g_app.was_airborne = true;
+                if (-pl->vel_y > pl->fall_peak) pl->fall_peak = -pl->vel_y;
             }
-            /* Ceiling clamp — crouching lowers the body height so the player
-             * fits under low openings (HEIGHT/4). */
-            f32 body_h = g_app.player.crouching ? PLAYER_CROUCH_HEIGHT
-                                                : PLAYER_BODY_HEIGHT;
-            f32 head_y = g_app.player.pos.y + body_h;
-            if (head_y > ceil_y) {
-                g_app.player.pos.y = ceil_y - body_h;
-                if (g_app.player.vel_y > 0) g_app.player.vel_y = 0;
+            if ((pl->pos.y - floor_y) <= PHY_STEP_HEIGHT && pl->vel_y <= 0.0f) {
+                /* Land / stay grounded. Step delta feeds the eye smoothing
+                 * (STEP_SPEED easing = the smooth stair feel, @0x444056). */
+                f32 drop = pl->pos.y - floor_y;
+                if (fabsf(drop) > 0.01f && fabsf(drop) <= PHY_STEP_HEIGHT &&
+                    !g_app.was_airborne)
+                    pl->eye_step_ofs += drop;
+                pl->pos.y = floor_y;
+                if (g_app.was_airborne) {
+                    /* Landing: sounds + fall damage (Player_TakeDamage
+                     * @0x445920: dmg = (speed-45)*0.2 above 45 u/s). */
+                    if (pl->fall_peak >= PHY_LAND_LIGHT)
+                        audio_play(&g_app.audio, g_app.sfx_player_land);
+                    if (pl->fall_peak > PHY_FALL_DMG_SPEED) {
+                        i32 dmg = (i32)((pl->fall_peak - PHY_FALL_DMG_SPEED)
+                                        * PHY_FALL_DMG_SCALE + 0.5f);
+                        if (dmg > 0) player_damage(pl, dmg);
+                    }
+                    g_app.was_airborne = false;
+                }
+                pl->vel_y = 0.0f;
+                pl->on_ground = true;
+                pl->fall_peak = 0.0f;
             }
 
-            /* Jump (Space on ground) */
-            if (input_key_pressed(&g_app.input, SDL_SCANCODE_SPACE) &&
-                g_app.player.on_ground)
-                g_app.player.vel_y = 20.0f;  /* ITM AIR_VEL_JUMP=20 */
+            /* Ceiling bump (@0x4449e9): head = feet + eye + HEAD_HEIGHT —
+             * crouch-aware automatically since the eye lowers. */
+            f32 head_y = pl->pos.y + col_h;
+            if (head_y > ceil_y) {
+                pl->pos.y = ceil_y - col_h;
+                if (pl->vel_y > 0) pl->vel_y = 0;
+            }
+
+            /* Jump (@0x444214): grounded && vy==0; impulse JUMP_VEL ×
+             * (1 + (intent-1)·energy%) — 20 walk, 30 running. */
+            if (pl->want_jump && pl->on_ground && pl->vel_y == 0.0f) {
+                f32 intent = pl->running ? PHY_RUN_MULT : 1.0f;
+                pl->vel_y = PHY_JUMP_VEL *
+                            (1.0f + (intent - 1.0f) * pl->energy * 0.01f);
+                pl->on_ground = false;
+                g_app.was_airborne = true;
+                pl->energy = OL_CLAMP(pl->energy + PHY_E_JUMP, 25.0f, 100.0f);
+            }
+            pl->want_jump = false;
 
             /* VELOCITY_Z: wind/push sectors — apply lateral force if in one */
             if (g_app.player.sector_idx >= 0) {
@@ -1552,40 +2087,68 @@ static void app_run(void) {
             }
         }
 
-        /* ---- Weapon firing (primary LMB, alternate RMB) ---- */
-        if (fired) {
-            do_player_shoot();
-            g_app.player.fire_anim = true;
-            g_app.player.fire_alt = false;
-            g_app.player.fire_anim_timer = 0.0f;
-            /* Compute duration from sum of frame dts (ms→sec), fallback 0.25s */
-            {
-                int wi = (int)g_app.player.weapons.current;
-                u32 total_ms = 0;
-                for (u32 f = 0; f < g_app.renderer.weapon_fire_frame_count[wi]; f++)
-                    total_ms += g_app.renderer.weapon_fire_dt[wi][f];
-                g_app.player.fire_anim_dur = total_ms > 0 ? (f32)total_ms / 1000.0f : 0.25f;
+        /* ---- Weapon firing: mode routing per the weapon's button table
+         * (Ghidra 0x513c28..; TNT inverted). Thrown weapons use cook/release
+         * mechanics; others autofire while held at the fire-chor rate. ---- */
+        (void)fired;
+        if (!g_app.player.dead) {
+            WeaponState *ws = &g_app.player.weapons;
+            const WeaponDef *wdef = &g_weapon_defs[ws->current];
+            bool lmb_held  = g_app.input.mouse_buttons[0] ||
+                             (g_app.screenshot_firing && g_app.screenshot_frames > 0);
+            bool rmb_held  = g_app.input.mouse_buttons[2];
+            bool lmb_press = lmb_held && !g_app.lmb_prev;
+            bool rmb_press = rmb_held && !g_app.rmb_prev;
+            g_app.lmb_prev = lmb_held;
+            g_app.rmb_prev = rmb_held;
+
+            /* Pressing fire interrupts a per-round reload after the current
+             * round finishes loading (Weapon_ReloadStep semantics). */
+            if ((lmb_press || rmb_press) && ws->reloading)
+                ws->reload_interrupt = true;
+
+            /* Weapon switch drops a held lit stick at the feet (power 0). */
+            if (ws->holding_lit && ws->current != WEAPON_DYNAMITE) {
+                player_throw(PROJ_DYNAMITE, 0.0f, true, ws->lit_fuse);
+                ws->holding_lit = false;
             }
-        }
-        /* Alternate fire (RMB = SDL_BUTTON_RIGHT=3, index 2) */
-        if (g_app.input.mouse_buttons[2] && !g_app.player.dead) {
-            if (weapon_fire_alt(&g_app.player.weapons)) {
-                do_player_shoot();
-                g_app.player.fire_anim = true;
-                g_app.player.fire_alt = true;
-                g_app.player.fire_anim_timer = 0.0f;
-                {
-                    int wi = (int)g_app.player.weapons.current;
-                    u32 total_ms = 0;
-                    for (u32 f = 0; f < g_app.renderer.weapon_fire2_frame_count[wi]; f++)
-                        total_ms += g_app.renderer.weapon_fire2_dt[wi][f];
-                    g_app.player.fire_anim_dur = total_ms > 0 ? (f32)total_ms / 1000.0f : 0.25f;
+
+            if (ws->current == WEAPON_KNIFE || ws->current == WEAPON_DYNAMITE) {
+                handle_thrown_weapon(lmb_press, lmb_held, rmb_press, dt);
+            } else {
+                int mode = -1;
+                if      (lmb_held) mode = wdef->button_mode[0];
+                else if (rmb_held) mode = wdef->button_mode[1];
+                if (mode >= 0 && !ws->reloading && ws->fire_cooldown <= 0.0f) {
+                    if (weapon_can_fire(ws)) {
+                        do_player_fire(mode);
+                    } else if (lmb_press || rmb_press) {
+                        /* Dry fire click (NO_AMMO_SOUND) */
+                        if (g_app.sfx_dry[ws->current])
+                            audio_play(&g_app.audio, g_app.sfx_dry[ws->current]);
+                        ws->fire_cooldown = 0.3f;
+                    }
                 }
             }
+
+            /* Rifle scope toggle (V): no aim error, full-range traces, zoom. */
+            if (input_key_pressed(&g_app.input, SDL_SCANCODE_V) && wdef->has_scope) {
+                ws->scope_active = !ws->scope_active;
+                renderer_set_zoom(&g_app.renderer, ws->scope_active ? 2.0f : 1.0f);
+            }
+            if (!wdef->has_scope && ws->scope_active) {
+                ws->scope_active = false;
+                renderer_set_zoom(&g_app.renderer, 1.0f);
+            }
         }
-        /* Manual reload (R key) */
-        if (input_key_pressed(&g_app.input, SDL_SCANCODE_R))
-            weapon_reload(&g_app.player.weapons);
+        /* Manual reload (R key): per-round, with the weapon's reload sound */
+        if (input_key_pressed(&g_app.input, SDL_SCANCODE_R)) {
+            WeaponState *ws = &g_app.player.weapons;
+            bool was = ws->reloading;
+            weapon_reload(ws);
+            if (!was && ws->reloading && g_app.sfx_reload_w[ws->current])
+                audio_play(&g_app.audio, g_app.sfx_reload_w[ws->current]);
+        }
         /* Automap overlay toggle (TAB) */
         if (input_key_pressed(&g_app.input, SDL_SCANCODE_TAB))
             g_app.show_map = !g_app.show_map;
@@ -1636,6 +2199,16 @@ static void app_run(void) {
                 InfDoorResult best = inf_nudge_door_near(
                     &g_app.world.inf, &g_app.world.lvt,
                     g_app.player.pos.x, g_app.player.pos.z, 22.0f, keys, &needed);
+
+                /* USE also nudges scenery (msg 0x7D3, Actor_NudgeTrace
+                 * @0x446cc0): SHOOT and NUDGE Inv_Object types react. */
+                {
+                    Vec3 eye = player_eye_pos(&g_app.player);
+                    f32 cp2 = cosf(g_app.player.pitch), sp2 = sinf(g_app.player.pitch);
+                    f32 cy2 = cosf(g_app.player.yaw),   sy2 = sinf(g_app.player.yaw);
+                    Vec3 fdir = { cy2*cp2, sp2, sy2*cp2 };
+                    entity_nudge(&g_app.world.entities, eye, fdir, 12.0f);
+                }
 
                 /* Also fire NUDGE triggers in the current + adjacent sectors. */
                 if (si >= 0 && si < (i32)g_app.world.lvt.sector_count) {
@@ -1732,6 +2305,22 @@ static void app_run(void) {
         if (g_app.message_timer > 0.0f) g_app.message_timer -= dt;
 
         /* ---- Entity AI ---- */
+        /* Thrown projectiles (knife / dynamite): physics, fuses, pickup */
+        projectile_update(&g_app.projectiles, &g_app.world.lvt, dt);
+        {
+            ProjKind pk = projectile_try_pickup(&g_app.projectiles,
+                                                g_app.player.pos);
+            if (pk == PROJ_KNIFE) {
+                g_app.player.weapons.has_weapon[WEAPON_KNIFE] = true;
+                weapon_add_ammo(&g_app.player.weapons, WEAPON_KNIFE, 1);
+                audio_play(&g_app.audio, g_app.sfx_pickup);
+            } else if (pk == PROJ_DYNAMITE) {
+                g_app.player.weapons.has_weapon[WEAPON_DYNAMITE] = true;
+                weapon_add_ammo(&g_app.player.weapons, WEAPON_DYNAMITE, 1);
+                audio_play(&g_app.audio, g_app.sfx_pickup);
+            }
+        }
+
         entity_update_all(&g_app.world.entities, g_app.player.pos, dt,
                           &g_app.world.lvt, on_player_hurt);
 
@@ -1779,6 +2368,43 @@ render_frame:
         renderer_draw_level(&g_app.renderer);
         renderer_draw_sprites(&g_app.renderer, &g_app.world.entities);
 
+        /* Projectiles: 3DO models (knife/dynamite) + FX billboards */
+        {
+            BillboardDraw bbs[MAX_PROJECTILES];
+            TdoDraw tds[MAX_PROJECTILES];
+            u32 nbb = 0, ntd = 0;
+            for (int i = 0; i < MAX_PROJECTILES; i++) {
+                const Projectile *p = &g_app.projectiles.list[i];
+                if (!p->active) continue;
+                if (p->tdo >= 0) {
+                    tds[ntd].pos    = (Vec3){ p->pos.x, p->pos.y + 0.4f, p->pos.z };
+                    tds[ntd].yaw    = p->yaw;
+                    tds[ntd].tumble = p->tumble;
+                    tds[ntd].id     = p->tdo;
+                    ntd++;
+                } else if (p->tex) {
+                    bbs[nbb].pos = p->pos;
+                    bbs[nbb].tex = p->tex;
+                    bbs[nbb].w   = p->w > 0 ? p->w : 1.0f;
+                    bbs[nbb].h   = p->h > 0 ? p->h : 1.0f;
+                    nbb++;
+                }
+            }
+            if (ntd) renderer_draw_tdos(&g_app.renderer, tds, ntd);
+            if (nbb) renderer_draw_billboards(&g_app.renderer, bbs, nbb);
+            if (getenv("OL_PROJLOG") && (nbb || ntd)) {
+                static int plog = 0;
+                if ((plog++ % 20) == 0)
+                    for (int i = 0; i < MAX_PROJECTILES; i++) {
+                        const Projectile *p = &g_app.projectiles.list[i];
+                        if (!p->active || p->kind == PROJ_FX) continue;
+                        OL_LOG("PROJ k=%d pos=(%.1f,%.2f,%.1f) rest=%d sec=%d\n",
+                               p->kind, p->pos.x, p->pos.y, p->pos.z,
+                               p->resting, p->sector);
+                    }
+            }
+        }
+
         /* HUD */
         {
             f32 fire_t = 0.0f;
@@ -1798,6 +2424,10 @@ render_frame:
                 .reloading    = g_app.player.weapons.reloading,
                 .firing       = g_app.player.fire_anim,
                 .fire_alt     = g_app.player.fire_alt,
+                .cooking      = g_app.player.weapons.cooking,
+                .cooking_alt  = (g_app.player.weapons.current == WEAPON_DYNAMITE),
+                .holding_lit  = g_app.player.weapons.holding_lit &&
+                                g_app.player.weapons.current == WEAPON_DYNAMITE,
                 .fire_timer   = OL_CLAMP(fire_t, 0.0f, 0.99f),
                 .message      = (g_app.message_timer > 0.0f) ? g_app.message_text : NULL,
                 .inventory    = build_hud_left_text(
@@ -2158,6 +2788,95 @@ int main(int argc, char **argv) {
         return code;
     }
     if (g_app.check_mode) {
+        /* OL_WEAPTEST: exercise the projectile/dynamite pipeline headlessly. */
+        if (getenv("OL_WEAPTEST")) {
+            Vec3 pp = g_app.world.player_start;
+            g_app.player.pos = pp;
+            /* Throw an UNLIT stick, let it fly and come to rest */
+            g_app.player.weapons.has_weapon[WEAPON_DYNAMITE] = true;
+            weapon_add_ammo(&g_app.player.weapons, WEAPON_DYNAMITE, 5);
+            player_throw(PROJ_DYNAMITE, 1.0f, false, 0.0f);
+            for (int f = 0; f < 300; f++)
+                projectile_update(&g_app.projectiles, &g_app.world.lvt, 1.0f/60.0f);
+            for (int i = 0; i < MAX_PROJECTILES; i++) {
+                Projectile *pr = &g_app.projectiles.list[i];
+                if (pr->active && pr->kind == PROJ_DYNAMITE)
+                    OL_LOG("WEAPTEST tnt at (%.1f,%.2f,%.1f) resting=%d lit=%d\n",
+                           pr->pos.x, pr->pos.y, pr->pos.z, pr->resting, pr->lit);
+            }
+            /* Shoot it: aim from player start at the stick */
+            {
+                Vec3 eye = player_eye_pos(&g_app.player);
+                for (int i = 0; i < MAX_PROJECTILES; i++) {
+                    Projectile *pr = &g_app.projectiles.list[i];
+                    if (!pr->active || pr->kind != PROJ_DYNAMITE) continue;
+                    Vec3 d = vec3_norm(vec3_sub((Vec3){pr->pos.x, pr->pos.y+0.5f, pr->pos.z}, eye));
+                    f32 hd; int pi = projectile_raycast(&g_app.projectiles, eye, d, 200.0f, &hd);
+                    OL_LOG("WEAPTEST shoot ray -> proj idx %d (dist %.1f)\n", pi, hd);
+                    if (pi >= 0) projectile_damage(&g_app.projectiles, pi);
+                    break;
+                }
+                /* Run fuse/explosion frames */
+                for (int f = 0; f < 60; f++)
+                    projectile_update(&g_app.projectiles, &g_app.world.lvt, 1.0f/60.0f);
+                int still = 0;
+                for (int i = 0; i < MAX_PROJECTILES; i++)
+                    if (g_app.projectiles.list[i].active &&
+                        g_app.projectiles.list[i].kind == PROJ_DYNAMITE) still++;
+                OL_LOG("WEAPTEST after shot: dynamite left=%d (0 = exploded)\n", still);
+            }
+            /* Knife throw → rest → pickup */
+            player_throw(PROJ_KNIFE, 0.8f, false, 0.0f);
+            for (int f = 0; f < 300; f++)
+                projectile_update(&g_app.projectiles, &g_app.world.lvt, 1.0f/60.0f);
+            for (int i = 0; i < MAX_PROJECTILES; i++) {
+                Projectile *pr = &g_app.projectiles.list[i];
+                if (pr->active && pr->kind == PROJ_KNIFE) {
+                    OL_LOG("WEAPTEST knife at (%.1f,%.2f,%.1f) resting=%d\n",
+                           pr->pos.x, pr->pos.y, pr->pos.z, pr->resting);
+                    g_app.player.pos = pr->pos;   /* walk to it */
+                }
+            }
+            ProjKind got = projectile_try_pickup(&g_app.projectiles, g_app.player.pos);
+            OL_LOG("WEAPTEST knife pickup: %s\n", got == PROJ_KNIFE ? "OK" : "FAIL");
+        }
+        /* OL_SCNTEST: exercise the scenery chor state machine headlessly —
+         * find a bottle, log its chors, shoot it, run updates, log outcome. */
+        if (getenv("OL_SCNTEST")) {
+            EntityList *el = &g_app.world.entities;
+            int found = 0;
+            for (u32 i = 0; i < el->count; i++) {
+                Entity *e = &el->entities[i];
+                if (!e->active || !e->is_scenery) continue;
+                if (found < 3)
+                    OL_LOG("SCNTEST %s: type=%d chors=%u state=%u playing=%d "
+                           "c0(n=%u end=%d) c1(n=%u end=%d snd=%d)\n",
+                           e->type_name, e->scenery_type, e->scn_count,
+                           e->scn_state, e->scn_playing,
+                           e->scn[0].nframes, e->scn[0].end,
+                           e->scn_count > 1 ? e->scn[1].nframes : 0,
+                           e->scn_count > 1 ? e->scn[1].end : -1,
+                           e->scn_count > 1 ? e->scn[1].sound_idx : -1);
+                static bool shot_one = false;
+                if (!shot_one && strncasecmp(e->type_name, "BOTTLE", 6) == 0) {
+                    shot_one = true;
+                    OL_LOG("SCNTEST bottle: chors=%u c1(n=%u end=%d snd=%d)\n",
+                           e->scn_count,
+                           e->scn_count > 1 ? e->scn[1].nframes : 0,
+                           e->scn_count > 1 ? e->scn[1].end : -1,
+                           e->scn_count > 1 ? e->scn[1].sound_idx : -1);
+                    OL_LOG("SCNTEST shooting %s (idx %u)...\n", e->type_name, i);
+                    entity_damage(el, (int)i, 2);
+                    for (int f = 0; f < 180; f++)
+                        entity_update_all(el, g_app.player.pos, 1.0f/60.0f,
+                                          &g_app.world.lvt, NULL);
+                    OL_LOG("SCNTEST after 3s: active=%d state=%u frame=%u playing=%d\n",
+                           e->active, e->scn_state, e->scn_frame, e->scn_playing);
+                }
+                found++;
+            }
+            OL_LOG("SCNTEST scenery entities total: %d\n", found);
+        }
         int code = print_level_check();
         app_shutdown();
         return code;

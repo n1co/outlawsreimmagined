@@ -58,7 +58,7 @@ typedef struct {
     u32          tri_count;
 } TdoObject;
 
-typedef struct {
+typedef struct TdoModel {
     char name[TDO_MAX_NAME];
     char palette[TDO_MAX_NAME];
     char textures[TDO_MAX_TEXTURES][TDO_MAX_NAME];

@@ -93,6 +93,7 @@ typedef struct {
     i32  ambient;
     f32  friction;
     f32  gravity;
+    f32  elasticity;   /* Bounce restitution (LVT ELASTICITY, default 0.3) */
 
     /* Sector flags */
     u32  flags;
