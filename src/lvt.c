@@ -252,9 +252,9 @@ static bool parse_sector(Parser *p, LvtSector *sec) {
             if (strcasecmp(tok, "Y") == 0) {
                 sec->floor_y       = read_float(p);
                 sec->floor_tex     = read_int(p);
-                sec->floor_offset.u = read_float(p);
-                sec->floor_offset.v = read_float(p);
-                read_int(p); /* flags */
+                sec->floor_offset.u = read_float(p);   /* offX (Ghidra +0x5c) */
+                sec->floor_offset.v = read_float(p);   /* offZ (Ghidra +0x6c) */
+                sec->floor_rot_deg  = read_float(p);   /* rotation (→ +0x7c) */
             } else if (strcasecmp(tok, "SOUND") == 0) {
                 read_token(p, tok, sizeof(tok)); /* sound name */
             } else if (strcasecmp(tok, "OFFSETS") == 0) {
@@ -267,9 +267,9 @@ static bool parse_sector(Parser *p, LvtSector *sec) {
             read_token(p, tok, sizeof(tok)); /* "Y" */
             sec->ceil_y       = read_float(p);
             sec->ceil_tex     = read_int(p);
-            sec->ceil_offset.u = read_float(p);
-            sec->ceil_offset.v = read_float(p);
-            read_int(p); /* flags */
+            sec->ceil_offset.u = read_float(p);   /* offX (Ghidra +0x60) */
+            sec->ceil_offset.v = read_float(p);   /* offZ (Ghidra +0x70) */
+            sec->ceil_rot_deg  = read_float(p);   /* rotation (→ +0x7e) */
             continue;
         }
         if (strcasecmp(tok, "F_OVERLAY") == 0 || strcasecmp(tok, "C_OVERLAY") == 0) {

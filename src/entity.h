@@ -187,7 +187,7 @@ PickupResult entity_try_pickup_ex(EntityList *list, Vec3 player_pos);
  * Returns the index of the first entity hit, or -1 if none.
  * Sets *dist to the hit distance.
  */
-int entity_raycast(const EntityList *list,
+int entity_raycast(const EntityList *list, const LvtLevel *level,
                    Vec3 origin, Vec3 dir,
                    f32 max_dist, f32 *dist);
 

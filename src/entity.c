@@ -470,7 +470,7 @@ PickupResult entity_try_pickup_ex(EntityList *list, Vec3 player_pos) {
 /* -------------------------------------------------------------------------
  * Raycast against entity bounding cylinders
  * ---------------------------------------------------------------------- */
-int entity_raycast(const EntityList *list,
+int entity_raycast(const EntityList *list, const LvtLevel *level,
                    Vec3 origin, Vec3 dir,
                    f32 max_dist, f32 *hit_dist) {
     int   best_idx  = -1;
@@ -502,6 +502,19 @@ int entity_raycast(const EntityList *list,
 
         best_dist = t;
         best_idx  = (int)i;
+    }
+
+    /* Line-of-sight gate: the shot is blocked by any solid wall between the
+     * shooter and the target — no more killing enemies through walls. LOS honors
+     * portal openings (windows/doorways) so you CAN shoot through those. */
+    if (best_idx >= 0 && level) {
+        const Entity *e = &list->entities[best_idx];
+        f32 ty = e->pos.y + e->sprite_h * 0.5f;
+        if (!collision_has_los(level, origin.x, origin.z, origin.y,
+                               e->pos.x, e->pos.z, ty)) {
+            best_idx = -1;
+            best_dist = max_dist;
+        }
     }
 
     if (hit_dist) *hit_dist = best_dist;

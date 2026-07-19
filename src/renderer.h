@@ -66,6 +66,7 @@ typedef struct {
     u32    tex_id;          /* Index into renderer's texture table */
     u32    sector_idx;      /* Source sector (0xFFFFFFFF = batched/no sector) */
     bool   is_scroll_floor; /* True: UV offset from INF scroll system applies */
+    bool   is_sign;         /* Wall sign overlay: drawn with polygon offset */
 } RenderMesh;
 
 /* Per-vertex data for world geometry */
@@ -103,6 +104,8 @@ typedef struct {
     GLuint prog_world;   /* World geometry shader */
     GLuint prog_sprite;  /* Billboard sprite shader */
     GLuint prog_hud;     /* 2D HUD shader */
+    GLuint prog_sky;     /* Parallax sky shader (Jedi cylindrical projection) */
+    GLuint sky_vao, sky_vbo; /* Fullscreen quad for the sky pass */
 
     /* Camera matrices (updated each frame) */
     Mat4 view;
@@ -199,7 +202,8 @@ typedef struct {
 
     /* Sky panorama texture (0 = none, use clear color) */
     u32 sky_tex;              /* Texture ID of sky panorama PCX */
-    f32 sky_parallax_x;      /* Panorama horizontal size (world units, from LVT) */
+    f32 sky_parallax_x;      /* Sky texels per full turn, horizontal (LVT PARALLAX) */
+    f32 sky_parallax_y;      /* Sky texels per full turn, vertical */
 
     /* Camera yaw/pitch cached from renderer_set_camera for sky rendering */
     f32 cam_yaw;
@@ -289,7 +293,7 @@ void renderer_update_anim_textures(Renderer *r, f32 dt);
  * sky_tex: texture ID from renderer_upload_texture (0 = disable sky).
  * parallax_x: horizontal panorama extent in world units (from LVT PARALLAX).
  */
-void renderer_set_sky(Renderer *r, u32 sky_tex, f32 parallax_x);
+void renderer_set_sky(Renderer *r, u32 sky_tex, f32 parallax_x, f32 parallax_y);
 
 /* Draw sky panorama background (call before renderer_draw_level). */
 void renderer_draw_sky(Renderer *r);

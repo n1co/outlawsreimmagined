@@ -280,6 +280,28 @@ void archives_close(Archives *arc) {
 /* Counts level textures that couldn't be found (level health check). */
 static u32 g_missing_tex = 0;
 
+/* Jedi-engine texel convention (TFE rtexture/rwallFloat, Outlaws same engine):
+ * texel (U=0,V=0) is the image's BOTTOM-left; V grows upward. PCX decodes rows
+ * top-down, so LEVEL textures (walls/flats/sky) are flipped vertically at
+ * upload so GL v=0 lands on the image's bottom row. The renderer's wall V
+ * (bottom-anchored, growing up) and flat V ((worldZ-offset)*8) then map 1:1 to
+ * the engine's texel space. HUD/menu/sprite uploads are untouched (their draw
+ * paths use top-down UVs). */
+static void flip_rgba_rows(u8 *rgba, u32 w, u32 h) {
+    if (!rgba || h < 2) return;
+    u32 stride = w * 4;
+    u8 *tmp = malloc(stride);
+    if (!tmp) return;
+    for (u32 y = 0; y < h / 2; y++) {
+        u8 *a = rgba + (size_t)y * stride;
+        u8 *b = rgba + (size_t)(h - 1 - y) * stride;
+        memcpy(tmp, a, stride);
+        memcpy(a, b, stride);
+        memcpy(b, tmp, stride);
+    }
+    free(tmp);
+}
+
 static void upload_level_textures(const LvtLevel *level,
                                    const Archives *arc,
                                    Renderer *r,
@@ -290,14 +312,6 @@ static void upload_level_textures(const LvtLevel *level,
         /* Blank / placeholder slot (e.g. ".PCX" with no basename) — not a real
          * texture reference; skip without counting it as missing. */
         if (name[0] == '.' || strlen(name) < 5) continue;
-        /* DEFAULT.PCX is a placeholder "no texture assigned" marker.
-         * Upload it as a neutral dark-gray so solid walls don't become invisible,
-         * but suppress it on portal mid-texture slots (open portals). */
-        if (strcasecmp(name, "DEFAULT.PCX") == 0) {
-            static const u8 gray[4] = { 48, 48, 48, 255 };
-            renderer_upload_texture(r, "default.pcx", gray, 1, 1);
-            continue;
-        }
         if (renderer_find_texture(r, name)) continue;
 
         u32 size = 0;
@@ -328,6 +342,7 @@ static void upload_level_textures(const LvtLevel *level,
                 rgba = palette ? pcx_decode_rgba_pal(data, size, &w, &h, palette)
                                 : pcx_decode_rgba(data, size, &w, &h);
             if (rgba) {
+                flip_rgba_rows(rgba, w, h);
                 renderer_upload_texture(r, lower_name, rgba, w, h);
                 free(rgba);
             }
@@ -436,6 +451,7 @@ static void upload_level_textures(const LvtLevel *level,
                     rgba = palette ? pcx_decode_rgba_pal(fd, fs, &w, &h, palette)
                                    : pcx_decode_rgba(fd, fs, &w, &h);
                 if (!rgba) continue;
+                flip_rgba_rows(rgba, w, h);
 
                 /* Name: frame 0 uses the ATX name (for mesh lookup), others get _fN suffix */
                 char tex_name[128];
@@ -1004,30 +1020,27 @@ bool world_load(World *world, Archives *arc,
         return false;
     }
 
-    /* Find sky panorama texture.
-     *
-     * Strategy 1: scan the LVT texture table for an entry whose name contains
-     * "SKY" — the sky texture is uploaded as part of the level textures above
-     * and already lives in the renderer's texture cache.
-     *
-     * Strategy 2 (fallback): try common filename patterns in the archives.
-     */
+    /* Find the sky panorama texture the way the original engine does: the sky
+     * IS the ceiling texture of a sky-flagged sector (flags bit 0; Ghidra
+     * sky_DrawCeiling@0x4b6190 reads sector->ceil_tex_handle). Use the first
+     * sky-ceiling sector's ceiling texture (a level's sky sectors share it).
+     * Fallback: a sky-floor (pit) sector's floor texture; then archive name
+     * patterns for safety. */
     {
         u32 sky_tid = 0;
 
-        /* Strategy 1: look for *SKY*.PCX in the level texture list */
-        for (u32 ti = 0; ti < world->lvt.texture_count && !sky_tid; ti++) {
-            const char *tname = world->lvt.textures[ti];
-            if (!tname[0]) continue;
-            /* Case-insensitive substring search for "sky" */
-            char lower_t[LVT_MAX_NAME];
-            snprintf(lower_t, sizeof(lower_t), "%s", tname);
-            for (char *p = lower_t; *p; p++) *p = tolower((unsigned char)*p);
-            if (strstr(lower_t, "sky"))
-                sky_tid = renderer_find_texture(r, lower_t);
+        for (u32 si = 0; si < world->lvt.sector_count && !sky_tid; si++) {
+            const LvtSector *s = &world->lvt.sectors[si];
+            i32 tex = -1;
+            if (s->flags & LVT_SEC_FLAG_SKY_CEIL)       tex = s->ceil_tex;
+            else if (s->flags & LVT_SEC_FLAG_SKY_FLOOR) tex = s->floor_tex;
+            if (tex >= 0 && (u32)tex < world->lvt.texture_count)
+                sky_tid = renderer_find_texture(r, world->lvt.textures[tex]);
         }
         if (sky_tid) {
-            OL_LOG("Sky panorama: found in LVT texture table\n");
+            OL_LOG("Sky panorama: sky-sector ceiling texture ('%s' %ux%u)\n",
+                   r->textures[sky_tid - 1].name,
+                   r->textures[sky_tid - 1].width, r->textures[sky_tid - 1].height);
         }
 
         /* Strategy 2: try common name patterns in archives */
@@ -1048,6 +1061,7 @@ bool world_load(World *world, Archives *arc,
                                ? pcx_decode_rgba_pal(sky_data, sky_size, &sw, &sh, arc->palette)
                                : pcx_decode_rgba(sky_data, sky_size, &sw, &sh);
                     if (rgba) {
+                        flip_rgba_rows(rgba, sw, sh);
                         sky_tid = renderer_upload_texture(r, "sky_panorama", rgba, sw, sh);
                         free(rgba);
                         OL_LOG("Sky panorama loaded from archive: %ux%u\n", sw, sh);
@@ -1056,7 +1070,7 @@ bool world_load(World *world, Archives *arc,
             }
         }
 
-        renderer_set_sky(r, sky_tid, world->lvt.parallax_x);
+        renderer_set_sky(r, sky_tid, world->lvt.parallax_x, world->lvt.parallax_y);
         if (!sky_tid) OL_LOG("No sky panorama found; using clear color\n");
     }
 

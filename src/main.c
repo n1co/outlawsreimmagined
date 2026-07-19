@@ -684,9 +684,105 @@ static bool load_level_runtime(const char *name) {
                    si, s->name, s->floor_y, s->ceil_y, cx, cz, s->wall_count, s->door_open);
             for (u32 wi=0; wi<s->wall_count; wi++){ const LvtWall*w=&s->walls[wi];
                 if(w->adjoin>=0){ const LvtSector*a=&L->sectors[w->adjoin];
-                    OL_LOG("   wall %u -> adjoin sec %d '%s' floor=%.1f ceil=%.1f\n",
-                           wi, w->adjoin, a->name, a->floor_y, a->ceil_y); } }
+                    Vec2 p0=s->vertices[w->v1], p1=s->vertices[w->v2];
+                    OL_LOG("   wall %u (%.0f,%.0f)-(%.0f,%.0f) mid(%.0f,%.0f) -> adjoin sec %d '%s' floor=%.1f ceil=%.1f flags=%#x flags2=%#x dadjoin=%d midtex=%d win=%d\n",
+                           wi, p0.x,p0.y, p1.x,p1.y, (p0.x+p1.x)*0.5f,(p0.y+p1.y)*0.5f,
+                           w->adjoin, a->name, a->floor_y, a->ceil_y, w->flags, w->flags2, w->dadjoin, w->mid.tex_id, w->is_window); } }
         }
+    }
+    if (getenv("OL_FINDTEX")) {
+        /* Find walls whose mid/top/bot texture NAME contains the substring.
+         * Print sector, wall, midpoint, and an outward normal + a suggested
+         * head-on camera pos (interior side) so a sign can be viewed squarely. */
+        const LvtLevel *L = &g_app.world.lvt;
+        const char *want = getenv("OL_FINDTEX");
+        int n=0;
+        for (u32 si=0; si<L->sector_count && n<20; si++){ const LvtSector*s=&L->sectors[si];
+            for (u32 wi=0; wi<s->wall_count && n<20; wi++){ const LvtWall*w=&s->walls[wi];
+                int ids[3]={w->mid.tex_id,w->top.tex_id,w->bot.tex_id};
+                const char*hit=NULL;
+                for(int k=0;k<3;k++){ if(ids[k]>=0 && ids[k]<(i32)LVT_MAX_TEXTURES){
+                    if(strcasestr(L->textures[ids[k]], want)){ hit=L->textures[ids[k]]; break; } } }
+                if(!hit) continue;
+                if(w->v1<0||w->v2<0) continue;
+                Vec2 p0=s->vertices[w->v1], p1=s->vertices[w->v2];
+                f32 mx=(p0.x+p1.x)*0.5f, mz=(p0.y+p1.y)*0.5f;
+                /* wall dir & a normal; interior is inside the sector so step toward centroid */
+                f32 cx=0,cz=0; for(u32 v=0;v<s->vertex_count;v++){cx+=s->vertices[v].x;cz+=s->vertices[v].y;}
+                if(s->vertex_count){cx/=s->vertex_count;cz/=s->vertex_count;}
+                f32 nx=cx-mx, nz=cz-mz; f32 nl=sqrtf(nx*nx+nz*nz); if(nl>0){nx/=nl;nz/=nl;}
+                f32 camx=mx+nx*18.0f, camz=mz+nz*18.0f;
+                f32 yaw=atan2f(-nx,-nz)*180.0f/3.14159265f; /* face the wall */
+                OL_LOG("FINDTEX sec %u wall %u '%s' mid(%.0f,%.0f) v1(%.0f,%.0f) v2(%.0f,%.0f) flags=%#x -> CAM pos %.0f %.0f yaw %.0f\n",
+                       si, wi, hit, mx,mz, p0.x,p0.y, p1.x,p1.y, w->flags, camx, camz, yaw);
+                n++;
+            } }
+        OL_LOG("FINDTEX done n=%d\n", n);
+    }
+    if (getenv("OL_TEXLIST")) {
+        const LvtLevel *L = &g_app.world.lvt;
+        for (u32 i=0;i<LVT_MAX_TEXTURES;i++){ if(L->textures[i][0]) OL_LOG("TEX %u = '%s'\n", i, L->textures[i]); }
+    }
+    if (getenv("OL_DUMPTEX")) {
+        /* Read back an uploaded GL texture by name substring -> PPM. Isolates the
+         * decoder/upload from UV/rendering: if text is mirrored HERE, the PCX
+         * decode is flipped; if correct here, the mirror is in the mesh UV. */
+        const char *want = getenv("OL_DUMPTEX");
+        const Renderer *r = &g_app.renderer;
+        for (u32 i=0;i<R_MAX_TEXTURES;i++){ const GpuTexture*t=&r->textures[i];
+            if(!t->handle || !strcasestr(t->name, want)) continue;
+            u32 w=t->width,h=t->height; if(!w||!h) continue;
+            u8 *buf = malloc((size_t)w*h*4); if(!buf) break;
+            glBindTexture(GL_TEXTURE_2D, t->handle);
+            glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, buf);
+            char path[256]; snprintf(path,sizeof(path),"%s/dumptex_%s.ppm", getenv("OL_DUMPDIR")?getenv("OL_DUMPDIR"):".", t->name);
+            FILE*f=fopen(path,"wb");
+            if(f){ fprintf(f,"P6\n%u %u\n255\n",w,h);
+                for(u32 p=0;p<w*h;p++) fwrite(&buf[p*4],1,3,f);
+                fclose(f); OL_LOG("DUMPTEX '%s' %ux%u -> %s\n", t->name, w, h, path); }
+            free(buf);
+        }
+    }
+    if (getenv("OL_SCANSIGN")) {
+        /* Locate walls flagged WF1_ILLUM_SIGN (0x02) — the sign textures. */
+        const LvtLevel *L = &g_app.world.lvt;
+        int n=0;
+        for (u32 si=0; si<L->sector_count; si++){ const LvtSector*s=&L->sectors[si];
+            for (u32 wi=0; wi<s->wall_count; wi++){ const LvtWall*w=&s->walls[wi];
+                if (!(w->flags & 0x02u)) continue;
+                if (w->v1<0||w->v2<0) continue;
+                Vec2 p0=s->vertices[w->v1], p1=s->vertices[w->v2];
+                if (n++ < 25)
+                    OL_LOG("SIGN sec %u wall %u mid(%.0f,%.0f) flags=%#x midtex=%d toptex=%d bottex=%d\n",
+                           si, wi, (p0.x+p1.x)*0.5f,(p0.y+p1.y)*0.5f, w->flags,
+                           w->mid.tex_id, w->top.tex_id, w->bot.tex_id);
+            } }
+        OL_LOG("SIGN total=%d\n", n);
+    }
+    if (getenv("OL_SCANMID")) {
+        /* Scan ADJOIN_MID (0x2000) walls, categorize by geometry + solidity flags */
+        const LvtLevel *L = &g_app.world.lvt;
+        int n_open=0, n_open_solid=0, n_open_win=0, n_step=0;
+        for (u32 si=0; si<L->sector_count; si++){ const LvtSector*s=&L->sectors[si];
+            for (u32 wi=0; wi<s->wall_count; wi++){ const LvtWall*w=&s->walls[wi];
+                if (w->adjoin<0 || !(w->flags & 0x2000u)) continue;
+                const LvtSector*a=&L->sectors[w->adjoin];
+                bool same_floor = (a->floor_y > s->floor_y-0.5f && a->floor_y < s->floor_y+0.5f);
+                bool same_ceil  = (a->ceil_y  > s->ceil_y -0.5f && a->ceil_y  < s->ceil_y +0.5f);
+                bool solid = (w->flags2 & 0x02u) != 0;
+                if (same_floor && same_ceil) {
+                    /* fully open span: candidate open-portal OR full-height fence */
+                    n_open++;
+                    if (solid) n_open_solid++;
+                    if (w->is_window) n_open_win++;
+                    if (n_open <= 12)
+                        OL_LOG("SCANMID sec %u wall %u -> %d  fl=%.1f/%.1f cl=%.1f/%.1f flags=%#x flags2=%#x dadj=%d midtex=%d win=%d\n",
+                               si, wi, w->adjoin, s->floor_y, a->floor_y, s->ceil_y, a->ceil_y,
+                               w->flags, w->flags2, w->dadjoin, w->mid.tex_id, w->is_window);
+                } else n_step++;
+            } }
+        OL_LOG("SCANMID totals: open_span=%d (solid=%d window=%d)  stepped=%d\n",
+               n_open, n_open_solid, n_open_win, n_step);
     }
     if (getenv("OL_PROBE2")) {
         const LvtLevel *L = &g_app.world.lvt;
@@ -934,6 +1030,14 @@ static bool app_init(int argc, char **argv) {
         return false;
     }
 
+    /* Screenshot mode: pin a fixed render size so a tiling WM resizing the
+     * window can't change the FOV/aspect between captures (makes A/B shots
+     * comparable). 800x600 fits inside any tile the WM hands us. */
+    if (g_app.screenshot_frames > 0) {
+        SDL_SetWindowSize(g_app.renderer.window, 800, 600);
+        renderer_resize(&g_app.renderer, 800, 600);
+    }
+
     /* Debug UI (ImGui) */
     debug_ui_init(g_app.renderer.window, g_app.renderer.gl_ctx);
 
@@ -1071,7 +1175,7 @@ static void do_player_shoot(void) {
     /* Melee weapons: short range, no raycast needed */
     if (def->melee) {
         f32 dist;
-        int idx = entity_raycast(&g_app.world.entities, eye, dir,
+        int idx = entity_raycast(&g_app.world.entities, &g_app.world.lvt, eye, dir,
                                  def->range_2, &dist);
         if (idx >= 0) {
             const Entity *e = &g_app.world.entities.entities[idx];
@@ -1094,7 +1198,7 @@ static void do_player_shoot(void) {
             shot_dir = vec3_norm(shot_dir);
         }
         f32 dist;
-        int idx = entity_raycast(&g_app.world.entities, eye, shot_dir,
+        int idx = entity_raycast(&g_app.world.entities, &g_app.world.lvt, eye, shot_dir,
                                  8192.0f, &dist);
         if (idx >= 0) {
             const Entity *e = &g_app.world.entities.entities[idx];
@@ -1127,7 +1231,7 @@ static void app_run(void) {
         if (g_app.input.quit) { g_app.running = false; break; }
 
         /* ---- Window resize ---- */
-        {
+        if (g_app.screenshot_frames <= 0) {   /* pinned in screenshot mode */
             int w, h;
             SDL_GetWindowSize(g_app.renderer.window, &w, &h);
             if (w != g_app.renderer.cfg.width || h != g_app.renderer.cfg.height)

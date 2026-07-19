@@ -106,6 +106,46 @@ static const char *HUD_FRAG_SRC =
 "    }\n"
 "}\n";
 
+/* Sky shader — exact Outlaws/Jedi parallax sky projection, per pixel.
+ * Ghidra olwin.exe: sky_BuildColumnAngleTable@0x4b09b0 (texel U per column =
+ * atan((x-centerX)/focal)/turn * parallaxX), sky_UpdateScrollOffsets@0x4b0920
+ * (U scroll = yawTurns*parallaxX; V scroll = -pitchTurns*parallaxY), and the
+ * span setup in sky_DrawCeiling@0x4b6190: V(y) = (texH-1) -
+ * ((y - viewH/2)*vScale + 100 - pitchTexels), vScale = 640/viewH texels/pixel
+ * (view init @0x4a68d9). V is a bottom-up texel index (texture columns are
+ * stored bottom-up); level textures are uploaded row-flipped so GL v = V/texH.
+ * The software renderer runs with parallax fixed at 1024x1024 (setter
+ * @0x4b0990, sole call passes 1024.0,1024.0). */
+static const char *SKY_VERT_SRC =
+"#version 330 core\n"
+"layout(location=0) in vec2 aPos;\n"      /* fullscreen quad in NDC */
+"void main() { gl_Position = vec4(aPos, 0.0, 1.0); }\n";
+
+static const char *SKY_FRAG_SRC =
+"#version 330 core\n"
+"out vec4 fragColor;\n"
+"uniform sampler2D uTex;\n"
+"uniform vec2  uScreen;    /* viewport W,H in pixels */\n"
+"uniform vec2  uTexSize;   /* sky texture W,H in texels */\n"
+"uniform vec2  uParallax;  /* texels per full turn (1024,1024) */\n"
+"uniform float uYawTurns;  /* camera yaw, Outlaws convention, in turns */\n"
+"uniform float uPitchTurns;/* camera pitch in turns, positive = up */\n"
+"uniform float uFocalPx;   /* horizontal focal length in pixels */\n"
+"#define PI 3.14159265358979\n"
+"void main() {\n"
+"    float dx  = gl_FragCoord.x - 0.5 * uScreen.x;\n"
+"    float ang = atan(dx / uFocalPx);\n"
+"    float U = (uYawTurns + ang / (2.0*PI)) * uParallax.x;\n"
+"    /* gl_FragCoord.y grows upward; software y grows downward */\n"
+"    float yDown  = uScreen.y - gl_FragCoord.y;\n"
+"    float vScale = 640.0 / uScreen.y;\n"
+"    float V = (uTexSize.y - 1.0)\n"
+"            - ((yDown - 0.5*uScreen.y) * vScale + 100.0\n"
+"               - uPitchTurns * uParallax.y);\n"
+"    vec2 uv = vec2(U / uTexSize.x, V / uTexSize.y);\n"
+"    fragColor = texture(uTex, uv);\n"   /* wraps via GL_REPEAT */
+"}\n";
+
 /* -------------------------------------------------------------------------
  * Shader compilation helpers
  * ---------------------------------------------------------------------- */
@@ -188,7 +228,22 @@ bool renderer_init(Renderer *r, const RenderConfig *cfg, const char *title) {
     r->prog_world  = link_program(WORLD_VERT_SRC,  WORLD_FRAG_SRC);
     r->prog_sprite = link_program(SPRITE_VERT_SRC, SPRITE_FRAG_SRC);
     r->prog_hud    = link_program(HUD_VERT_SRC,    HUD_FRAG_SRC);
-    if (!r->prog_world || !r->prog_sprite || !r->prog_hud) return false;
+    r->prog_sky    = link_program(SKY_VERT_SRC,    SKY_FRAG_SRC);
+    if (!r->prog_world || !r->prog_sprite || !r->prog_hud || !r->prog_sky)
+        return false;
+
+    /* Fullscreen quad for the sky pass (NDC positions only) */
+    {
+        static const f32 quad[] = { -1,-1,  1,-1,  1,1,  -1,-1,  1,1,  -1,1 };
+        glGenVertexArrays(1, &r->sky_vao);
+        glGenBuffers(1, &r->sky_vbo);
+        glBindVertexArray(r->sky_vao);
+        glBindBuffer(GL_ARRAY_BUFFER, r->sky_vbo);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2*sizeof(f32), (void*)0);
+        glEnableVertexAttribArray(0);
+        glBindVertexArray(0);
+    }
 
     /* GL state defaults */
     glEnable(GL_DEPTH_TEST);
@@ -276,7 +331,9 @@ void renderer_shutdown(Renderer *r) {
     if (r->prog_world)  glDeleteProgram(r->prog_world);
     if (r->prog_sprite) glDeleteProgram(r->prog_sprite);
     if (r->prog_hud)    glDeleteProgram(r->prog_hud);
+    if (r->prog_sky)    glDeleteProgram(r->prog_sky);
 
+    if (r->sky_vao)    { glDeleteVertexArrays(1, &r->sky_vao);    glDeleteBuffers(1, &r->sky_vbo); }
     if (r->sprite_vao) { glDeleteVertexArrays(1, &r->sprite_vao); glDeleteBuffers(1, &r->sprite_vbo); }
     if (r->hud_vao)    { glDeleteVertexArrays(1, &r->hud_vao);    glDeleteBuffers(1, &r->hud_vbo); }
     if (r->missing_tex) glDeleteTextures(1, &r->missing_tex);
@@ -492,54 +549,126 @@ static RenderMesh mb_upload(MeshBuilder *mb) {
  * Build a textured wall quad between two vertices at given floor/ceiling Y.
  * Adds 4 vertices and 6 indices (2 triangles) to the builder.
  */
+/*
+ * Emit one wall strip as a TRAPEZOID: the bottom edge runs y_bot0..y_bot1 and
+ * the top edge y_top0..y_top1, so the wall follows SLOPED floors/ceilings at
+ * each endpoint and meets the sloped flats with no gap (the flat rectangle this
+ * replaced left "sky-bleed" triangles on slope-heavy maps like CANYON).
+ * V is anchored per-column to the strip's top (top-pegged) or bottom
+ * (bottom-pegged) so the texture flows correctly down the slope.
+ */
 static void build_wall_quad(MeshBuilder *mb,
                              f32 x0, f32 z0, f32 x1, f32 z1,
-                             f32 y_bot, f32 y_top,
+                             f32 y_bot0, f32 y_top0, f32 y_bot1, f32 y_top1,
                              f32 u_off, f32 v_off,
                              f32 ambient_norm, u32 flags,
                              u32 tex_w, u32 tex_h) {
-    /* Wall length for texture U coordinate */
     f32 dx = x1 - x0, dz = z1 - z0;
     f32 wall_len = sqrtf(dx*dx + dz*dz);
-    f32 wall_h   = y_top - y_bot;
 
     /* UV scale: 1 world unit = 8 texels. UV = world * 8 / tex_dim. */
     f32 u_scale = (tex_w > 0) ? (WU_TO_TEXEL / (f32)tex_w) : (WU_TO_TEXEL / 64.0f);
     f32 v_scale = (tex_h > 0) ? (WU_TO_TEXEL / (f32)tex_h) : (WU_TO_TEXEL / 64.0f);
 
+    /* U runs along the wall from v1 (u_off) to v2 (u_off+len); v1 is the
+     * screen-left endpoint seen from the sector interior (TFE rwallFloat
+     * wall_process: uCoord0 anchors at w0/LEFT, backface test guarantees
+     * w0 projects left of w1). WF1_FLIP_HORIZ (0x04) mirrors in TEXTURE space:
+     * texelU -> texW-1-texelU (rwallFloat.cpp:838-840), i.e. u -> 1-u in
+     * normalized coords — NOT an endpoint swap (a swap mirrors around the
+     * quad's own span and shifts the texture phase). */
     f32 u0 = u_off * u_scale;
     f32 u1 = (u_off + wall_len) * u_scale;
+    if (flags & 0x04u) { u0 = 1.0f - u0; u1 = 1.0f - u1; }
 
-    f32 v_top, v_bot;
-    if (flags & 0x40u) {
-        /* TEX_ANCHORED (bit 6): bottom-pegged. Texture pinned to floor.
-         * RE docs: "pinned to the floor so it doesn't shift when ceiling moves" */
-        v_bot = (v_off + wall_h) * v_scale;
-        v_top = v_off * v_scale;
-    } else {
-        /* Default: top-pegged. Texture pinned to ceiling. */
-        v_top = v_off * v_scale;
-        v_bot = (v_off + wall_h) * v_scale;
-    }
-
-    /* Flag 0x04: flip U (horizontal).
-     * RE docs: "u = (tex_width - u) - 1 after wrap" */
-    if (flags & 0x04u) {
-        f32 tmp = u0; u0 = u1; u1 = tmp;
-    }
+    /* Jedi/Outlaws walls are BOTTOM-anchored with V running UPWARD from the
+     * strip's bottom edge: V = ((worldY - stripBottomY) + v_off) * 8/texH.
+     * (Verified: TFE rwallFloat.cpp anchors at the floor pixel; Outlaws
+     * Wall_ComputeOpenings@0x4e4600 uses (top-bottom)*8 texel spans.) The raw
+     * LVT v_offset is used as-is — the engine never subtracts a sector height,
+     * so all the old `- floor_y` / `- adj_ceil` call-site hacks are gone. */
+    f32 v_b0 = v_off * v_scale;
+    f32 v_t0 = ((y_top0 - y_bot0) + v_off) * v_scale;
+    f32 v_b1 = v_off * v_scale;
+    f32 v_t1 = ((y_top1 - y_bot1) + v_off) * v_scale;
 
     u32 base = mb->vert_count;
-
-    /* Bottom-left, bottom-right, top-right, top-left */
     WorldVertex verts[4] = {
-        { x0, y_bot, -z0, u0, v_bot, ambient_norm },
-        { x1, y_bot, -z1, u1, v_bot, ambient_norm },
-        { x1, y_top, -z1, u1, v_top, ambient_norm },
-        { x0, y_top, -z0, u0, v_top, ambient_norm },
+        { x0, y_bot0, -z0, u0, v_b0, ambient_norm },
+        { x1, y_bot1, -z1, u1, v_b1, ambient_norm },
+        { x1, y_top1, -z1, u1, v_t1, ambient_norm },
+        { x0, y_top0, -z0, u0, v_t0, ambient_norm },
     };
     for (int i = 0; i < 4; i++) mb_push_vert(mb, verts[i]);
 
     /* CW triangles (interior-facing after LVT→GL Z-negation flips winding) */
+    mb_push_idx(mb, base+0); mb_push_idx(mb, base+2); mb_push_idx(mb, base+1);
+    mb_push_idx(mb, base+0); mb_push_idx(mb, base+3); mb_push_idx(mb, base+2);
+}
+
+/*
+ * Wall SIGN overlay (LVT OVERLAY slot) — Ghidra wall_FillZBuffer_Textured
+ * @0x4c71c0 + TFE setupSignTexture (rwallFloat.cpp:711-740):
+ *   - Drawn where the host wall part's texel U (incl. the part's own u
+ *     offset, measured from v1) lies in [signU0 .. signU0+signW], with
+ *     signU0 = overlay.u*8. The sign is NEVER mirrored by WF1_FLIP_HORIZ.
+ *   - V anchors at the part's bottom edge; positive overlay.v moves the sign
+ *     DOWN by overlay.v world units; the sign spans texH/8 wu upward and is
+ *     clipped strictly to the part (no tiling).
+ *   - Fullbright when wall flag 0x2 (WF1_ILLUM_SIGN) is set.
+ * The quad is emitted into a dedicated sign builder and drawn with polygon
+ * offset over the coplanar wall part (the software renderer overdraws the
+ * same columns; depth-offset is the GL equivalent).
+ *
+ * sec_u_off: the HOST PART's texture u offset (mid/top/bot slot).
+ * yb0/yb1, yt0/yt1: the host part's bottom/top edges at the wall endpoints.
+ */
+static void build_sign_quad(MeshBuilder *mb,
+                            f32 x0, f32 z0, f32 x1, f32 z1,
+                            f32 sec_u_off, const WallTex *ov,
+                            f32 yb0, f32 yt0, f32 yb1, f32 yt1,
+                            f32 light, u32 tex_w, u32 tex_h) {
+    f32 dx = x1 - x0, dz = z1 - z0;
+    f32 wall_len = sqrtf(dx*dx + dz*dz);
+    if (tex_w == 0 || tex_h == 0 || wall_len <= 0.0f) return;
+
+    f32 sw = (f32)tex_w / WU_TO_TEXEL;   /* sign extent in world units */
+    f32 sh = (f32)tex_h / WU_TO_TEXEL;
+
+    /* Horizontal window along the wall (distance from v1). */
+    f32 d0 = ov->offset.u - sec_u_off;
+    f32 d1 = d0 + sw;
+    f32 u0 = 0.0f, u1 = 1.0f;
+    if (d0 < 0.0f)      { u0 = -d0 / sw;                  d0 = 0.0f; }
+    if (d1 > wall_len)  { u1 = 1.0f - (d1 - wall_len)/sw; d1 = wall_len; }
+    if (d1 <= d0) return;
+
+    f32 t0 = d0 / wall_len, t1 = d1 / wall_len;
+    f32 ax = x0 + dx*t0, az = z0 + dz*t0;
+    f32 bx = x0 + dx*t1, bz = z0 + dz*t1;
+
+    /* Vertical extent per endpoint: part bottom edge (lerped) - overlay.v,
+     * clipped to the part span, v texels adjusted proportionally.
+     * GL v=0 = image bottom row (level textures are uploaded row-flipped). */
+    f32 partB0 = yb0 + (yb1 - yb0)*t0, partB1 = yb0 + (yb1 - yb0)*t1;
+    f32 partT0 = yt0 + (yt1 - yt0)*t0, partT1 = yt0 + (yt1 - yt0)*t1;
+    f32 b0 = partB0 - ov->offset.v, b1 = partB1 - ov->offset.v;
+    f32 tp0 = b0 + sh,              tp1 = b1 + sh;
+    f32 vb0 = 0.0f, vb1 = 0.0f, vt0 = 1.0f, vt1 = 1.0f;
+    if (b0 < partB0)  { vb0 = (partB0 - b0)/sh;        b0 = partB0; }
+    if (b1 < partB1)  { vb1 = (partB1 - b1)/sh;        b1 = partB1; }
+    if (tp0 > partT0) { vt0 = 1.0f - (tp0 - partT0)/sh; tp0 = partT0; }
+    if (tp1 > partT1) { vt1 = 1.0f - (tp1 - partT1)/sh; tp1 = partT1; }
+    if (tp0 <= b0 || tp1 <= b1) return;
+
+    u32 base = mb->vert_count;
+    WorldVertex verts[4] = {
+        { ax, b0,  -az, u0, vb0, light },
+        { bx, b1,  -bz, u1, vb1, light },
+        { bx, tp1, -bz, u1, vt1, light },
+        { ax, tp0, -az, u0, vt0, light },
+    };
+    for (int i = 0; i < 4; i++) mb_push_vert(mb, verts[i]);
     mb_push_idx(mb, base+0); mb_push_idx(mb, base+2); mb_push_idx(mb, base+1);
     mb_push_idx(mb, base+0); mb_push_idx(mb, base+3); mb_push_idx(mb, base+2);
 }
@@ -587,6 +716,23 @@ static void build_floor_poly(MeshBuilder *mb,
         }
     }
 
+    /* Outlaws flat texel mapping (Ghidra flat_FillZBuffer_Floor@0x4b4bb0 /
+     * _Ceiling@0x4b42a0, identical formulas for both):
+     *   U_texel =  8*((z-offZ)*cos(rot) - (x-offX)*sin(rot))
+     *   V_texel = -8*((x-offX)*cos(rot) + (z-offZ)*sin(rot))
+     * where U indexes WITHIN a stored column (bottom-up rows after the
+     * row-flipped upload → GL v) and V indexes ACROSS columns (image x →
+     * GL u). At rot=0 this is GLu = (offX-x)*8/texW, GLv = (z-offZ)*8/texH
+     * — matching Dark Forces/TFE; the rotation is an Outlaws addition. */
+    f32 rot_deg  = sec ? (is_floor ? sec->floor_rot_deg : sec->ceil_rot_deg) : 0.0f;
+    f32 cr = 1.0f, sr = 0.0f;
+    if (rot_deg != 0.0f) {
+        f32 a = rot_deg * OL_DEG2RAD;
+        cr = cosf(a); sr = sinf(a);
+    }
+    f32 fu_scale = (tex_w > 0) ? (WU_TO_TEXEL / (f32)tex_w) : (WU_TO_TEXEL / 64.0f);
+    f32 fv_scale = (tex_h > 0) ? (WU_TO_TEXEL / (f32)tex_h) : (WU_TO_TEXEL / 64.0f);
+
     u32 base = mb->vert_count;
     for (u32 i = 0; i < count; i++) {
         WorldVertex v;
@@ -596,10 +742,10 @@ static void build_floor_poly(MeshBuilder *mb,
                            verts_xz[i].x, verts_xz[i].y)
               : y;
         v.z = -verts_xz[i].y;  /* LVT Z → GL -Z */
-        f32 fu_scale = (tex_w > 0) ? (WU_TO_TEXEL / (f32)tex_w) : (WU_TO_TEXEL / 64.0f);
-        f32 fv_scale = (tex_h > 0) ? (WU_TO_TEXEL / (f32)tex_h) : (WU_TO_TEXEL / 64.0f);
-        v.u = (u_off + verts_xz[i].x) * fu_scale;
-        v.v = (v_off + verts_xz[i].y) * fv_scale;
+        f32 dx = verts_xz[i].x - u_off;   /* world X - offX */
+        f32 dz = verts_xz[i].y - v_off;   /* world Z - offZ */
+        v.u = -(dx*cr + dz*sr) * fu_scale;
+        v.v =  (dz*cr - dx*sr) * fv_scale;
         v.light = ambient_norm;
         mb_push_vert(mb, v);
     }
@@ -723,8 +869,9 @@ bool renderer_build_level(Renderer *r, const LvtLevel *level, const InfSystem *i
 
     if (!level || level->sector_count == 0) return false;
 
-    /* DEFAULT.PCX texture ID: uploaded as neutral gray; skip on portal mid-slots
-     * (open portals use it as a placeholder meaning "no fence here"). */
+    /* DEFAULT.PCX now renders like any texture (the original engine draws the
+     * slot's handle regardless). Only the MORPH-door leaf workaround still uses
+     * this id, to prefer a real panel texture for the swinging apron. */
     u32 default_pcx_tex = renderer_find_texture(r, "default.pcx");
 
     /*
@@ -738,6 +885,12 @@ bool renderer_build_level(Renderer *r, const LvtLevel *level, const InfSystem *i
     /* Builder 0 = no texture (debug purple) */
     mb_init(&builders[0], 0);
     for (u32 i = 1; i <= r->texture_count; i++) mb_init(&builders[i], i);
+
+    /* Wall sign overlays get their own builders: they are coplanar with the
+     * wall parts they decorate and are drawn after them with polygon offset. */
+    MeshBuilder *sign_builders = calloc(R_MAX_TEXTURES + 1, sizeof(MeshBuilder));
+    if (!sign_builders) { free(builders); return false; }
+    for (u32 i = 0; i <= r->texture_count; i++) mb_init(&sign_builders[i], i);
 
     /* Per-sector scroll floor builders (one per scroll-floor sector).
      * Indexed as scroll_si[i] = sector index, scroll_mb[i] = its builder. */
@@ -793,8 +946,10 @@ bool renderer_build_level(Renderer *r, const LvtLevel *level, const InfSystem *i
                 }
             }
 
-            /* Render floor for EVERY loop */
-            u32 ftex = resolve_tex(r, level, sec->floor_tex);
+            /* Render floor for EVERY loop — except SKY floors (flag bit 1,
+             * Ghidra sky_DrawFloor@0x4b6410: bottomless pit showing sky). */
+            u32 ftex = (sec->flags & LVT_SEC_FLAG_SKY_FLOOR) ? 0
+                       : resolve_tex(r, level, sec->floor_tex);
             if (ftex > 0) {
                 u32 ftw, fth; tex_dims(r, ftex, &ftw, &fth);
                 for (u32 li = 0; li < lcnt; li++) {
@@ -816,9 +971,10 @@ bool renderer_build_level(Renderer *r, const LvtLevel *level, const InfSystem *i
                 }
             }
 
-            /* Render ceiling for EVERY loop.
-             * Ghidra RE: bit 1 (0x02) = NO_CEIL (skip ceiling), not bit 0. */
-            if (!(sec->flags & LVT_SEC_FLAG_NO_CEIL)) {
+            /* Render ceiling for EVERY loop — except SKY ceilings (flag bit 0,
+             * Ghidra sky_DrawCeiling@0x4b6190): the parallax sky pass shows
+             * through instead of a textured plane. */
+            if (!(sec->flags & LVT_SEC_FLAG_SKY_CEIL)) {
                 u32 ctex = resolve_tex(r, level, sec->ceil_tex);
                 if (ctex > 0) {
                     u32 ctw, cth; tex_dims(r, ctex, &ctw, &cth);
@@ -846,31 +1002,46 @@ bool renderer_build_level(Renderer *r, const LvtLevel *level, const InfSystem *i
             /* Sky-boundary walls: invisible portals that outline the sky volume */
             if (wall->flags & LVT_WALL_FLAG_SKY_BOUNDARY) continue;
 
+            /* This sector's floor/ceiling at each wall endpoint (slope-aware) so
+             * wall strips are trapezoids that meet the sloped flats seamlessly. */
+            f32 sF0 = lvt_floor_at(sec, x0, z0), sF1 = lvt_floor_at(sec, x1, z1);
+            f32 sC0 = lvt_ceil_at (sec, x0, z0), sC1 = lvt_ceil_at (sec, x1, z1);
+
             u32 mid_tex = resolve_tex(r, level, wall->mid.tex_id);
             u32 top_tex = resolve_tex(r, level, wall->top.tex_id);
             u32 bot_tex = resolve_tex(r, level, wall->bot.tex_id);
 
             f32 wall_light = OL_CLAMP(ambient + wall->light / 31.0f, 0.0f, 1.0f);
 
-            if (wall->adjoin < 0) {
-                /* Skip degenerate zero-length walls */
-                f32 wdx = x1-x0, wdz = z1-z0;
-                if (wdx*wdx + wdz*wdz < 0.001f) continue;
+            /* Skip degenerate zero-length walls */
+            { f32 wdx = x1-x0, wdz = z1-z0;
+              if (wdx*wdx + wdz*wdz < 0.001f) continue; }
 
-                /* Solid wall: LVT v_offset includes the sector's floor height.
-                 * The original engine (Ghidra RE) subtracts floor_y so that
-                 * textures tile seamlessly across sectors at different heights.
-                 * Example: BANK pillar (sec 603, floor=0, v=3.25) and upper
-                 * facade (sec 38, floor=7.5, v=10.80) both become v≈3.25
-                 * after adjustment, making the GWBANK01 texture align. */
-                if (mid_tex > 0 && mid_tex != default_pcx_tex) {
+            /* Wall sign overlay (OVERLAY slot). Fullbright when flag 0x2
+             * (WF1_ILLUM_SIGN; Ghidra: colormap-less blitter @0x4d0e10). */
+            u32 ov_tex = (wall->overlay.tex_id >= 0)
+                         ? resolve_tex(r, level, wall->overlay.tex_id) : 0;
+            u32 ov_w = 0, ov_h = 0;
+            if (ov_tex > 0) tex_dims(r, ov_tex, &ov_w, &ov_h);
+            f32 sign_light = (wall->flags & 0x2u) ? 1.0f : wall_light;
+            /* Emits the sign onto one host wall part (per-part anchor). */
+            #define EMIT_SIGN(part_u_off, b0, t0, b1, t1)                     \
+                do { if (ov_tex > 0)                                          \
+                    build_sign_quad(&sign_builders[ov_tex], x0, z0, x1, z1,   \
+                                    (part_u_off), &wall->overlay,             \
+                                    (b0), (t0), (b1), (t1),                   \
+                                    sign_light, ov_w, ov_h); } while (0)
+
+            if (wall->adjoin < 0) {
+                /* Solid wall: one MID quad, floor to ceiling, raw LVT offsets. */
+                if (mid_tex > 0) {
                     u32 mw, mh; tex_dims(r, mid_tex, &mw, &mh);
-                    f32 v_adj = wall->mid.offset.v - sec->floor_y;
                     build_wall_quad(&builders[mid_tex],
                                     x0, z0, x1, z1,
-                                    sec->floor_y, sec->ceil_y,
-                                    wall->mid.offset.u, v_adj,
+                                    sF0, sC0, sF1, sC1,
+                                    wall->mid.offset.u, wall->mid.offset.v,
                                     wall_light, wall->flags, mw, mh);
+                    EMIT_SIGN(wall->mid.offset.u, sF0, sC0, sF1, sC1);
                 }
             } else {
                 /* Portal wall: render TOP and BOT strips */
@@ -878,60 +1049,14 @@ bool renderer_build_level(Renderer *r, const LvtLevel *level, const InfSystem *i
                                        ? &level->sectors[wall->adjoin] : NULL;
                 f32 adj_floor = adj ? adj->floor_y : sec->floor_y;
                 f32 adj_ceil  = adj ? adj->ceil_y  : sec->ceil_y;
+                /* Adjoin floor/ceil at each endpoint (slope-aware) for the strips. */
+                f32 aF0 = adj ? lvt_floor_at(adj, x0, z0) : sF0;
+                f32 aF1 = adj ? lvt_floor_at(adj, x1, z1) : sF1;
+                f32 aC0 = adj ? lvt_ceil_at (adj, x0, z0) : sC0;
+                f32 aC1 = adj ? lvt_ceil_at (adj, x1, z1) : sC1;
 
-                if (wall->flags & LVT_WALL_FLAG_ADJOIN_MID) {
-                    /* ADJOIN_MID with DADJOIN: 3-sector portal (arch/passthrough).
-                     * The area between sec_floor and adj_floor is the PASSAGEWAY.
-                     * Don't render BOT strip — it would block the walkway.
-                     * Only render TOP strip (arch top texture).
-                     *
-                     * ADJOIN_MID without DADJOIN: 2-sector portal (window/fence).
-                     * Render both TOP and BOT strips (solid wall around window). */
-                    bool is_passthrough = (wall->dadjoin >= 0);
-
-                    /* TOP strip: v_adj = v - adj_ceil (strip bottom) */
-                    if (adj_ceil < sec->ceil_y && top_tex > 0 && top_tex != default_pcx_tex) {
-                        u32 tw, th; tex_dims(r, top_tex, &tw, &th);
-                        f32 tv_adj = wall->top.offset.v - adj_ceil;
-                        build_wall_quad(&builders[top_tex], x0, z0, x1, z1,
-                                        adj_ceil, sec->ceil_y,
-                                        wall->top.offset.u, tv_adj,
-                                        wall_light, wall->flags, tw, th);
-                    }
-                    /* BOT strip — skip for passthrough (arch) */
-                    if (!is_passthrough && adj_floor > sec->floor_y &&
-                        bot_tex > 0 && bot_tex != default_pcx_tex) {
-                        u32 tw, th; tex_dims(r, bot_tex, &tw, &th);
-                        f32 tv_adj = wall->bot.offset.v - sec->floor_y;
-                        build_wall_quad(&builders[bot_tex], x0, z0, x1, z1,
-                                        sec->floor_y, adj_floor,
-                                        wall->bot.offset.u, tv_adj,
-                                        wall_light, wall->flags, tw, th);
-                    }
-                    /* MID texture as transparent overlay in the OPENING.
-                     * TFE RE: WF1_ADJ_MID_TEX (flag bit 0) controls whether
-                     * the MID texture renders on portal walls. In Outlaws LVT,
-                     * flag 0x2000 = ADJOIN_MID (portal type), but the MID
-                     * overlay only renders if flag bit 0 (0x01) is ALSO set.
-                     * Without bit 0, the MID is used for collision only.
-                     * Example: BANK windows have flags=0xa800 (no bit 0) →
-                     * NO MID overlay. Bars are visible as solid walls inside
-                     * the window recess sector behind the portal. */
-                    if (!is_passthrough && (wall->flags & 0x01u) && !wall->window_broken &&
-                        mid_tex > 0 && mid_tex != default_pcx_tex) {
-                        u32 mw, mh; tex_dims(r, mid_tex, &mw, &mh);
-                        f32 open_bot = adj_floor > sec->floor_y ? adj_floor : sec->floor_y;
-                        f32 open_top = adj_ceil  < sec->ceil_y  ? adj_ceil  : sec->ceil_y;
-                        if (open_top > open_bot) {
-                            f32 tv_adj = wall->mid.offset.v - open_bot;
-                            build_wall_quad(&builders[mid_tex], x0, z0, x1, z1,
-                                            open_bot, open_top,
-                                            wall->mid.offset.u, tv_adj,
-                                            wall_light, wall->flags, mw, mh);
-                        }
-                    }
-                } else if (wall->dadjoin >= 0 &&
-                           wall->dadjoin < (i32)level->sector_count) {
+                if (wall->dadjoin >= 0 &&
+                    wall->dadjoin < (i32)level->sector_count) {
                     /* DADJOIN portal: 3-sector vertical split.
                      * Ghidra RE of Wall_ComputeOpenings: the wall has TWO
                      * portal openings and up to 3 solid strips:
@@ -949,47 +1074,46 @@ bool renderer_build_level(Renderer *r, const LvtLevel *level, const InfSystem *i
                     const LvtSector *dadj = &level->sectors[wall->dadjoin];
                     f32 dadj_floor = dadj->floor_y;
                     f32 dadj_ceil  = dadj->ceil_y;
+                    f32 dF0 = lvt_floor_at(dadj, x0, z0), dF1 = lvt_floor_at(dadj, x1, z1);
+                    f32 dC0 = lvt_ceil_at (dadj, x0, z0), dC1 = lvt_ceil_at (dadj, x1, z1);
 
-                    /* TOP strip: v_adj = v - adj_ceil (strip bottom) */
-                    if (adj_ceil < sec->ceil_y && top_tex > 0 && top_tex != default_pcx_tex) {
+                    /* TOP strip: adj_ceil → sec_ceil (above the upper opening) */
+                    if (adj_ceil < sec->ceil_y && top_tex > 0 &&
+                        !(sec->flags & adj->flags & LVT_SEC_FLAG_SKY_CEIL)) {
                         u32 tw, th; tex_dims(r, top_tex, &tw, &th);
-                        f32 tv_adj = wall->top.offset.v - adj_ceil;
                         build_wall_quad(&builders[top_tex], x0, z0, x1, z1,
-                                        adj_ceil, sec->ceil_y,
-                                        wall->top.offset.u, tv_adj,
+                                        aC0, sC0, aC1, sC1,
+                                        wall->top.offset.u, wall->top.offset.v,
                                         wall_light, wall->flags, tw, th);
+                        EMIT_SIGN(wall->top.offset.u, aC0, sC0, aC1, sC1);
                     }
-                    /* MID strip: v_adj = v - dadj_ceil (strip bottom) */
-                    if (dadj_ceil < adj_floor && mid_tex > 0 && mid_tex != default_pcx_tex) {
+                    /* MID strip: dadj_ceil → adj_floor (between the two openings) */
+                    if (dadj_ceil < adj_floor && mid_tex > 0) {
                         u32 mw, mh; tex_dims(r, mid_tex, &mw, &mh);
-                        f32 tv_adj = wall->mid.offset.v - dadj_ceil;
                         build_wall_quad(&builders[mid_tex], x0, z0, x1, z1,
-                                        dadj_ceil, adj_floor,
-                                        wall->mid.offset.u, tv_adj,
+                                        dC0, aF0, dC1, aF1,
+                                        wall->mid.offset.u, wall->mid.offset.v,
                                         wall_light, wall->flags, mw, mh);
+                        EMIT_SIGN(wall->mid.offset.u, dC0, aF0, dC1, aF1);
                     }
-                    /* BOT strip: v_adj = v - sec_floor (strip bottom) */
-                    if (dadj_floor > sec->floor_y) {
-                        u32 t; f32 tu, tv;
-                        if (bot_tex > 0 && bot_tex != default_pcx_tex) {
-                            t = bot_tex; tu = wall->bot.offset.u;
-                            tv = wall->bot.offset.v - sec->floor_y;
-                        } else if (mid_tex > 0 && mid_tex != default_pcx_tex) {
-                            t = mid_tex; tu = wall->mid.offset.u;
-                            tv = wall->mid.offset.v - sec->floor_y;
-                        } else { t = 0; tu = tv = 0; }
-                        if (t > 0) {
-                            u32 tw, th; tex_dims(r, t, &tw, &th);
-                            build_wall_quad(&builders[t], x0, z0, x1, z1,
-                                            sec->floor_y, dadj_floor,
-                                            tu, tv,
-                                            wall_light, wall->flags, tw, th);
-                        }
+                    /* BOT strip: sec_floor → dadj_floor (below the lower opening) */
+                    if (dadj_floor > sec->floor_y && bot_tex > 0) {
+                        u32 tw, th; tex_dims(r, bot_tex, &tw, &th);
+                        build_wall_quad(&builders[bot_tex], x0, z0, x1, z1,
+                                        sF0, dF0, sF1, dF1,
+                                        wall->bot.offset.u, wall->bot.offset.v,
+                                        wall_light, wall->flags, tw, th);
+                        EMIT_SIGN(wall->bot.offset.u, sF0, dF0, sF1, dF1);
                     }
                 } else {
-                    /* Regular portal (no DADJOIN): TOP/BOT strips */
-                    bool has_top = (adj_ceil < sec->ceil_y);
-                    bool has_bot = (adj_floor > sec->floor_y);
+                    /* Regular portal (no DADJOIN): TOP/BOT strips.
+                     * Jedi sky rule (TFE wall_drawTop/Bottom): when BOTH sectors
+                     * have a sky ceiling (resp. sky floor), the step strip is
+                     * not textured — the sky continues through it. */
+                    bool sky_both_c = (sec->flags & adj->flags & LVT_SEC_FLAG_SKY_CEIL);
+                    bool sky_both_f = (sec->flags & adj->flags & LVT_SEC_FLAG_SKY_FLOOR);
+                    bool has_top = (adj_ceil < sec->ceil_y) && !sky_both_c;
+                    bool has_bot = (adj_floor > sec->floor_y) && !sky_both_f;
 
                     /* Swinging door panels.
                      * A MORPH door leaf sector (e.g. HOTELDOOR01) sits at the top
@@ -1011,67 +1135,52 @@ bool renderer_build_level(Renderer *r, const LvtLevel *level, const InfSystem *i
                          * floor, using this (moving) sector's vertices. */
                         u32 t; f32 tu, tv;
                         if (bot_tex > 0 && bot_tex != default_pcx_tex) {
-                            t = bot_tex; tu = wall->bot.offset.u;
-                            tv = wall->bot.offset.v - adj_floor;
+                            t = bot_tex; tu = wall->bot.offset.u; tv = wall->bot.offset.v;
                         } else if (mid_tex > 0 && mid_tex != default_pcx_tex) {
-                            t = mid_tex; tu = wall->mid.offset.u;
-                            tv = wall->mid.offset.v - adj_floor;
+                            t = mid_tex; tu = wall->mid.offset.u; tv = wall->mid.offset.v;
                         } else { t = 0; tu = tv = 0; }
                         if (t > 0) {
                             u32 tw, th; tex_dims(r, t, &tw, &th);
                             build_wall_quad(&builders[t], x0, z0, x1, z1,
-                                            adj_floor, sec->floor_y,
+                                            aF0, sF0, aF1, sF1,
                                             tu, tv, wall_light, wall->flags, tw, th);
                         }
                     }
 
-                    /* TOP strip: v_adj = v - adj_ceil (strip bottom) */
-                    if (has_top) {
-                        u32 t = (top_tex > 0 && top_tex != default_pcx_tex) ? top_tex : 0;
-                        if (t > 0) {
-                            u32 tw, th; tex_dims(r, t, &tw, &th);
-                            f32 tv_adj = wall->top.offset.v - adj_ceil;
-                            build_wall_quad(&builders[t], x0, z0, x1, z1,
-                                            adj_ceil, sec->ceil_y,
-                                            wall->top.offset.u, tv_adj,
-                                            wall_light, wall->flags, tw, th);
-                        }
+                    /* TOP strip: adj_ceil → sec_ceil */
+                    if (has_top && top_tex > 0) {
+                        u32 tw, th; tex_dims(r, top_tex, &tw, &th);
+                        build_wall_quad(&builders[top_tex], x0, z0, x1, z1,
+                                        aC0, sC0, aC1, sC1,
+                                        wall->top.offset.u, wall->top.offset.v,
+                                        wall_light, wall->flags, tw, th);
+                        EMIT_SIGN(wall->top.offset.u, aC0, sC0, aC1, sC1);
                     }
-                    /* BOT strip: v_adj = v - sec_floor (strip bottom) */
-                    if (has_bot) {
-                        u32 t; f32 tu, tv;
-                        if (bot_tex > 0 && bot_tex != default_pcx_tex) {
-                            t = bot_tex; tu = wall->bot.offset.u;
-                            tv = wall->bot.offset.v - sec->floor_y;
-                        } else if (mid_tex > 0 && mid_tex != default_pcx_tex) {
-                            t = mid_tex; tu = wall->mid.offset.u;
-                            tv = wall->mid.offset.v - sec->floor_y;
-                        } else { t = 0; tu = tv = 0; }
-                        if (t > 0) {
-                            u32 tw, th; tex_dims(r, t, &tw, &th);
-                            build_wall_quad(&builders[t], x0, z0, x1, z1,
-                                            sec->floor_y, adj_floor,
-                                            tu, tv,
-                                            wall_light, wall->flags, tw, th);
-                        }
+                    /* BOT strip: sec_floor → adj_floor */
+                    if (has_bot && bot_tex > 0) {
+                        u32 tw, th; tex_dims(r, bot_tex, &tw, &th);
+                        build_wall_quad(&builders[bot_tex], x0, z0, x1, z1,
+                                        sF0, aF0, sF1, aF1,
+                                        wall->bot.offset.u, wall->bot.offset.v,
+                                        wall_light, wall->flags, tw, th);
+                        EMIT_SIGN(wall->bot.offset.u, sF0, aF0, sF1, aF1);
                     }
-                    /* MID mask overlay in the portal opening: glass windows,
-                     * fences, grilles. Wall flag bit 0 (0x01 = "render MID
-                     * texture on this portal") marks a mask wall. Outlaws glass
-                     * windows use GW*WIN.ATX animated textures on regular portal
-                     * walls with bit 0 set (but NOT the ADJOIN_MID 0x2000 flag),
-                     * so they must render here, not only in the ADJOIN_MID case.
-                     * A window that has been shot out (shattered) is skipped. */
+                    /* MID mask overlay in the portal opening (maskwall: glass
+                     * windows, fences, grilles). The ONLY flag that controls
+                     * this is WF1_ADJ_MID_TEX = bit 0 (TFE rwall.h:25,
+                     * rsectorFloat.cpp:488-492) — portal structure itself is
+                     * pure geometry. A shot-out glass window is skipped. */
                     if ((wall->flags & 0x01u) && !wall->window_broken &&
-                        mid_tex > 0 && mid_tex != default_pcx_tex) {
+                        mid_tex > 0) {
                         f32 open_bot = adj_floor > sec->floor_y ? adj_floor : sec->floor_y;
                         f32 open_top = adj_ceil  < sec->ceil_y  ? adj_ceil  : sec->ceil_y;
+                        f32 ob0 = aF0 > sF0 ? aF0 : sF0, ob1 = aF1 > sF1 ? aF1 : sF1;
+                        f32 ot0 = aC0 < sC0 ? aC0 : sC0, ot1 = aC1 < sC1 ? aC1 : sC1;
                         if (open_top > open_bot) {
                             u32 mw, mh; tex_dims(r, mid_tex, &mw, &mh);
-                            f32 tv_adj = wall->mid.offset.v - open_bot;
                             build_wall_quad(&builders[mid_tex], x0, z0, x1, z1,
-                                            open_bot, open_top,
-                                            wall->mid.offset.u, tv_adj,
+                                            ob0, ot0, ob1, ot1,
+                                            wall->mid.offset.u, wall->mid.offset.v,
                                             wall_light, wall->flags, mw, mh);
                         }
                     }
@@ -1080,14 +1189,18 @@ bool renderer_build_level(Renderer *r, const LvtLevel *level, const InfSystem *i
         }
     }
 
+    #undef EMIT_SIGN
+
     /* Count non-empty builders and upload */
     u32 mesh_count = 0;
     for (u32 i = 0; i <= r->texture_count; i++)
         if (builders[i].vert_count > 0) mesh_count++;
+    for (u32 i = 0; i <= r->texture_count; i++)
+        if (sign_builders[i].vert_count > 0) mesh_count++;
     mesh_count += scroll_count;
 
     r->level_meshes = calloc(mesh_count, sizeof(RenderMesh));
-    if (!r->level_meshes) { free(builders); return false; }
+    if (!r->level_meshes) { free(builders); free(sign_builders); return false; }
     r->level_mesh_count = 0;
 
     u32 dbg_total_verts = 0, dbg_total_idx = 0;
@@ -1112,7 +1225,19 @@ bool renderer_build_level(Renderer *r, const LvtLevel *level, const InfSystem *i
         r->level_meshes[r->level_mesh_count++] = m;
     }
 
+    /* Upload wall sign meshes last: they are drawn after the coplanar wall
+     * parts, with polygon offset (see renderer_draw_level). */
+    for (u32 i = 0; i <= r->texture_count; i++) {
+        if (sign_builders[i].vert_count > 0) {
+            RenderMesh m = mb_upload(&sign_builders[i]);
+            m.sector_idx = 0xFFFFFFFF;
+            m.is_sign = true;
+            r->level_meshes[r->level_mesh_count++] = m;
+        }
+    }
+
     free(builders);
+    free(sign_builders);
     OL_LOG("Level geom: %u floors built\n", dbg_floors);
     OL_LOG("Level built: %u draw calls (%u scroll floors)\n",
            r->level_mesh_count, scroll_count);
@@ -1192,8 +1317,18 @@ void renderer_draw_level(Renderer *r) {
             glUniform2f(uvoff_loc, 0.0f, 0.0f);
         }
 
+        /* Wall signs are coplanar overdraws of their host wall part (the
+         * software renderer draws them over the same columns); pull them
+         * toward the viewer so they win the depth test. */
+        if (mesh->is_sign) {
+            glEnable(GL_POLYGON_OFFSET_FILL);
+            glPolygonOffset(-1.0f, -2.0f);
+        }
+
         glBindVertexArray(mesh->vao);
         glDrawElements(GL_TRIANGLES, (GLsizei)mesh->index_count, GL_UNSIGNED_INT, 0);
+
+        if (mesh->is_sign) glDisable(GL_POLYGON_OFFSET_FILL);
     }
     glBindVertexArray(0);
     /* (polygon offset was disabled above) */
@@ -1222,59 +1357,44 @@ void renderer_sync_scroll(Renderer *r, const InfSystem *inf) {
  * camera pitch. The panorama wraps at u=1.
  * ---------------------------------------------------------------------- */
 
-void renderer_set_sky(Renderer *r, u32 sky_tex, f32 parallax_x) {
+void renderer_set_sky(Renderer *r, u32 sky_tex, f32 parallax_x, f32 parallax_y) {
     r->sky_tex        = sky_tex;
+    /* The original software renderer runs the sky with parallax fixed at
+     * 1024x1024 texels per revolution (Ghidra: setter @0x4b0990, sole caller
+     * passes 1024.0,1024.0). Shipped LVTs all say PARALLAX 1024 1024 anyway;
+     * honor the LVT value when present. */
     r->sky_parallax_x = (parallax_x > 0.0f) ? parallax_x : 1024.0f;
+    r->sky_parallax_y = (parallax_y > 0.0f) ? parallax_y : 1024.0f;
 }
 
 void renderer_draw_sky(Renderer *r) {
-    if (!r->sky_tex || !r->prog_hud || !r->hud_vao) return;
+    if (!r->sky_tex || !r->prog_sky || !r->sky_vao) return;
     if (r->sky_tex > r->texture_count) return;
 
-    f32 W = (f32)r->cfg.width;
-    f32 H = (f32)r->cfg.height;
-    Mat4 ortho = mat4_ortho(0, W, H, 0, -1, 1);
+    f32 W  = (f32)r->cfg.width;
+    f32 H  = (f32)r->cfg.height;
+    f32 tw = (f32)r->textures[r->sky_tex - 1].width;
+    f32 th = (f32)r->textures[r->sky_tex - 1].height;
 
-    /*
-     * UV calculation for panoramic sky:
-     *   Horizontal (u): yaw maps 0..2π to 0..1 (one full panorama wrap).
-     *   The fraction of the panorama visible at the current FOV:
-     *     horiz_frac = horizontal_fov / (2π)
-     *   u at left edge  = yaw/(2π) - horiz_frac/2
-     *   u at right edge = yaw/(2π) + horiz_frac/2
-     *
-     *   Vertical (v): pitch maps pitch_limit..−pitch_limit to 0..1.
-     *     v = 0.5 - pitch / (vertical_fov)
-     *   We show a vertical band matching the vertical FOV.
-     */
-    f32 aspect     = (f32)r->cfg.width / (f32)r->cfg.height;
-    f32 hfov       = 2.0f * atanf(tanf(r->cam_fov_rad * 0.5f) * aspect);
-    f32 horiz_frac = hfov / (2.0f * OL_PI);
-    f32 yaw_frac   = r->cam_yaw / (2.0f * OL_PI);
+    /* Horizontal focal length in pixels from the horizontal FOV. */
+    f32 aspect = W / H;
+    f32 hfov   = 2.0f * atanf(tanf(r->cam_fov_rad * 0.5f) * aspect);
+    f32 focal  = (W * 0.5f) / tanf(hfov * 0.5f);
 
-    /* Negate because increasing yaw (left-turn) should shift sky right */
-    f32 u0 = -yaw_frac - horiz_frac * 0.5f;
-    f32 u1 = -yaw_frac + horiz_frac * 0.5f;
+    /* Our yaw convention: 0 = +X, pi/2 = +Z. Outlaws (Render_SetCamera
+     * @0x4a66e0): 0 = +Z, increasing toward +X. yaw_outlaws = pi/2 - yaw. */
+    f32 yaw_turns   = (0.5f * OL_PI - r->cam_yaw) / (2.0f * OL_PI);
+    f32 pitch_turns = r->cam_pitch / (2.0f * OL_PI);
 
-    /* Vertical: pitch 0 = horizon (v=0.5), pitch up = v decreases */
-    f32 vert_frac = r->cam_fov_rad / (2.0f * OL_PI);
-    f32 v_center  = 0.5f - r->cam_pitch / (2.0f * OL_PI);
-    f32 v0        = v_center - vert_frac * 0.5f;
-    f32 v1        = v_center + vert_frac * 0.5f;
-
-    /* 6 vertices (2 triangles), format: x,y, u,v, r,g,b,a (8 floats each) */
-    f32 verts[6 * 8] = {
-        0,0, u0,v0, 1,1,1,1,  W,0, u1,v0, 1,1,1,1,  W,H, u1,v1, 1,1,1,1,
-        0,0, u0,v0, 1,1,1,1,  W,H, u1,v1, 1,1,1,1,  0,H, u0,v1, 1,1,1,1,
-    };
-
-    glUseProgram(r->prog_hud);
-    GLint ortho_loc  = glGetUniformLocation(r->prog_hud, "uOrtho");
-    GLint hastex_loc = glGetUniformLocation(r->prog_hud, "uHasTex");
-    GLint tex_loc    = glGetUniformLocation(r->prog_hud, "uTex");
-    glUniformMatrix4fv(ortho_loc, 1, GL_FALSE, &ortho.m[0][0]);
-    glUniform1i(hastex_loc, 1);
-    glUniform1i(tex_loc, 0);
+    glUseProgram(r->prog_sky);
+    glUniform1i(glGetUniformLocation(r->prog_sky, "uTex"), 0);
+    glUniform2f(glGetUniformLocation(r->prog_sky, "uScreen"), W, H);
+    glUniform2f(glGetUniformLocation(r->prog_sky, "uTexSize"), tw, th);
+    glUniform2f(glGetUniformLocation(r->prog_sky, "uParallax"),
+                r->sky_parallax_x, r->sky_parallax_y);
+    glUniform1f(glGetUniformLocation(r->prog_sky, "uYawTurns"), yaw_turns);
+    glUniform1f(glGetUniformLocation(r->prog_sky, "uPitchTurns"), pitch_turns);
+    glUniform1f(glGetUniformLocation(r->prog_sky, "uFocalPx"), focal);
 
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
@@ -1282,13 +1402,11 @@ void renderer_draw_sky(Renderer *r) {
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, r->textures[r->sky_tex - 1].handle);
-    /* Enable horizontal wrapping so the panorama repeats seamlessly */
+    /* Both axes wrap (the original masks U and V with pow2 masks). */
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
 
-    glBindVertexArray(r->hud_vao);
-    glBindBuffer(GL_ARRAY_BUFFER, r->hud_vbo);
-    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(verts), verts);
+    glBindVertexArray(r->sky_vao);
     glDrawArrays(GL_TRIANGLES, 0, 6);
 
     glDepthMask(GL_TRUE);

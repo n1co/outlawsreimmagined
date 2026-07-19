@@ -29,9 +29,11 @@
 #define LVT_MAX_WALLS      512
 #define LVT_MAX_SECTORS    1024
 
-/* Sector flags (first word) */
-#define LVT_SEC_FLAG_EXTERIOR  0x1u   /* Outdoor/sky sector: floor uses sky renderer */
-#define LVT_SEC_FLAG_NO_CEIL   0x2u   /* Ceiling not rendered (sky ceiling) */
+/* Sector flags (first word) — Ghidra sky_DrawCeiling/sky_DrawFloor @0x4b6190/
+ * 0x4b6410: bit 0 = ceiling is sky, bit 1 = floor is sky (pit). Bits 30/31 =
+ * sloped floor / sloped ceiling (set by the loader from SLOPEDFLOOR/CEILING). */
+#define LVT_SEC_FLAG_SKY_CEIL   0x1u  /* Ceiling rendered as parallax sky */
+#define LVT_SEC_FLAG_SKY_FLOOR  0x2u  /* Floor rendered as parallax sky (pit) */
 
 /* Wall flags (first word) — from LVT binary analysis */
 #define LVT_WALL_FLAG_SKY_BOUNDARY  0x20000u  /* Sky-boundary portal wall: skip rendering */
@@ -79,11 +81,13 @@ typedef struct {
     f32  floor_y;
     i32  floor_tex;
     TexOffset floor_offset;
+    f32  floor_rot_deg;   /* Flat texture rotation (FLOOR Y 5th field, degrees) */
 
     /* Ceiling */
     f32  ceil_y;
     i32  ceil_tex;
     TexOffset ceil_offset;
+    f32  ceil_rot_deg;
 
     /* Lighting / physics */
     i32  ambient;

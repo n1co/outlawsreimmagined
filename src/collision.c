@@ -235,36 +235,22 @@ static bool wall_is_solid(const LvtLevel *level, i32 si, u32 wi,
     if (w->flags & 0x200u)
         return false;
 
-    /* ADJOIN_MID walls: passability depends on DADJOIN.
-     * The arch has dadjoin>=0 on the OUTER walls (sec 605/606) but
-     * dadjoin=-1 on the INNER walls (sec 340/341 mirror walls).
-     * Check both this wall AND the mirror wall's sector for dadjoin. */
+    /* ADJOIN_MID walls (flag 0x2000): the 0x2000 bit does NOT by itself mean
+     * "solid fence". Empirically (SCANMID sweep, 2026-07) EVERY 0x2000 wall
+     * whose span is fully open (adjoin floor & ceil == this sector's) is a
+     * plain open portal — never flagged WF3_SOLID_WALL, never a window — yet
+     * treating 0x2000+dadjoin=-1 as a solid fence sealed whole sectors into
+     * boxes (CANYON sec 131 = 17 phantom walls, HIDEOUT = 86). Passability is
+     * therefore decided GEOMETRICALLY below, exactly like a normal adjoin.
+     * The only genuine solid masks are:
+     *   - WF3_SOLID_WALL (flags2 & 0x02) — handled above,
+     *   - breakable glass windows (is_window) — blocked here until shot out.
+     * Arches remain passable: their opening is a same-floor portal (geometric
+     * pass) and/or carries a dadjoin (handled by the DADJOIN branch below). */
     if (w->flags & LVT_WALL_FLAG_ADJOIN_MID) {
-        /* Sky-boundary edges (0x20000) marked ADJOIN_MID are OPEN passages at
-         * the edge of a sky volume, not solid fences — they are invisible
-         * (skipped by the renderer) and must be walkable. Fall through to the
-         * normal step/headroom passability check.
-         * Example: TOWN sector 593 wall v68->v0 (flags 0x2a000) is the open edge
-         * between two same-height upper-floor areas — treating it as a solid
-         * ADJOIN_MID produced an invisible wall. */
-        if (!(w->flags & LVT_WALL_FLAG_SKY_BOUNDARY)) {
-            /* Check this wall's dadjoin */
-            if (w->dadjoin >= 0)
-                return false;
-            /* Check mirror wall's dadjoin: if the adj sector has a wall
-             * back to us with dadjoin>=0, this is a passthrough */
-            if (w->adjoin >= 0 && w->adjoin < (i32)level->sector_count &&
-                w->mirror >= 0) {
-                const LvtSector *adj_s = &level->sectors[w->adjoin];
-                if (w->mirror < (i32)adj_s->wall_count) {
-                    const LvtWall *mw = &adj_s->walls[w->mirror];
-                    if (mw->dadjoin >= 0)
-                        return false;
-                }
-            }
-            return true; /* solid fence/window */
-        }
-        /* sky-boundary ADJOIN_MID: fall through to step/headroom check */
+        if (w->is_window && !w->window_broken)
+            return true; /* intact glass window: solid until broken */
+        /* else: fall through to the geometric step/headroom check */
     }
 
     const LvtSector *adj = &level->sectors[w->adjoin];
@@ -554,10 +540,14 @@ bool collision_has_los(const LvtLevel *level, f32 ax, f32 az, f32 ay,
         /* Solid wall: blocks LOS */
         if (best_adj < 0 || best_adj >= (i32)level->sector_count) return false;
 
-        /* ADJOIN_MID fence/window also blocks LOS */
+        /* Only an intact glass window blocks LOS. A bare ADJOIN_MID adjoin is an
+         * OPEN portal (see [[project_collision]] — 0x2000 alone is not a fence),
+         * so a non-default mid texture must NOT block sight; that wrongly sealed
+         * off open canyon portals (CANYON sec 131, midtex=17) and stopped the
+         * player shooting enemies that were plainly visible across them. */
         const LvtWall *bw = &sec->walls[best_wi];
         if ((bw->flags & LVT_WALL_FLAG_ADJOIN_MID) &&
-            bw->mid.tex_id >= 0 && !lvt_is_default_tex(level, bw->mid.tex_id))
+            bw->is_window && !bw->window_broken)
             return false;
 
         /* Check height at the portal — ray must fit through the opening */
