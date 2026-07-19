@@ -1078,7 +1078,7 @@ bool renderer_build_level(Renderer *r, const LvtLevel *level, const InfSystem *i
                     f32 dC0 = lvt_ceil_at (dadj, x0, z0), dC1 = lvt_ceil_at (dadj, x1, z1);
 
                     /* TOP strip: adj_ceil → sec_ceil (above the upper opening) */
-                    if (adj_ceil < sec->ceil_y && top_tex > 0 &&
+                    if (adj_ceil < sec->ceil_y && top_tex > 0 && top_tex != default_pcx_tex &&
                         !(sec->flags & adj->flags & LVT_SEC_FLAG_SKY_CEIL)) {
                         u32 tw, th; tex_dims(r, top_tex, &tw, &th);
                         build_wall_quad(&builders[top_tex], x0, z0, x1, z1,
@@ -1088,7 +1088,7 @@ bool renderer_build_level(Renderer *r, const LvtLevel *level, const InfSystem *i
                         EMIT_SIGN(wall->top.offset.u, aC0, sC0, aC1, sC1);
                     }
                     /* MID strip: dadj_ceil → adj_floor (between the two openings) */
-                    if (dadj_ceil < adj_floor && mid_tex > 0) {
+                    if (dadj_ceil < adj_floor && mid_tex > 0 && mid_tex != default_pcx_tex) {
                         u32 mw, mh; tex_dims(r, mid_tex, &mw, &mh);
                         build_wall_quad(&builders[mid_tex], x0, z0, x1, z1,
                                         dC0, aF0, dC1, aF1,
@@ -1097,7 +1097,7 @@ bool renderer_build_level(Renderer *r, const LvtLevel *level, const InfSystem *i
                         EMIT_SIGN(wall->mid.offset.u, dC0, aF0, dC1, aF1);
                     }
                     /* BOT strip: sec_floor → dadj_floor (below the lower opening) */
-                    if (dadj_floor > sec->floor_y && bot_tex > 0) {
+                    if (dadj_floor > sec->floor_y && bot_tex > 0 && bot_tex != default_pcx_tex) {
                         u32 tw, th; tex_dims(r, bot_tex, &tw, &th);
                         build_wall_quad(&builders[bot_tex], x0, z0, x1, z1,
                                         sF0, dF0, sF1, dF1,
@@ -1148,7 +1148,7 @@ bool renderer_build_level(Renderer *r, const LvtLevel *level, const InfSystem *i
                     }
 
                     /* TOP strip: adj_ceil → sec_ceil */
-                    if (has_top && top_tex > 0) {
+                    if (has_top && top_tex > 0 && top_tex != default_pcx_tex) {
                         u32 tw, th; tex_dims(r, top_tex, &tw, &th);
                         build_wall_quad(&builders[top_tex], x0, z0, x1, z1,
                                         aC0, sC0, aC1, sC1,
@@ -1157,7 +1157,7 @@ bool renderer_build_level(Renderer *r, const LvtLevel *level, const InfSystem *i
                         EMIT_SIGN(wall->top.offset.u, aC0, sC0, aC1, sC1);
                     }
                     /* BOT strip: sec_floor → adj_floor */
-                    if (has_bot && bot_tex > 0) {
+                    if (has_bot && bot_tex > 0 && bot_tex != default_pcx_tex) {
                         u32 tw, th; tex_dims(r, bot_tex, &tw, &th);
                         build_wall_quad(&builders[bot_tex], x0, z0, x1, z1,
                                         sF0, aF0, sF1, aF1,
@@ -1171,7 +1171,7 @@ bool renderer_build_level(Renderer *r, const LvtLevel *level, const InfSystem *i
                      * rsectorFloat.cpp:488-492) — portal structure itself is
                      * pure geometry. A shot-out glass window is skipped. */
                     if ((wall->flags & 0x01u) && !wall->window_broken &&
-                        mid_tex > 0) {
+                        mid_tex > 0 && mid_tex != default_pcx_tex) {
                         f32 open_bot = adj_floor > sec->floor_y ? adj_floor : sec->floor_y;
                         f32 open_top = adj_ceil  < sec->ceil_y  ? adj_ceil  : sec->ceil_y;
                         f32 ob0 = aF0 > sF0 ? aF0 : sF0, ob1 = aF1 > sF1 ? aF1 : sF1;

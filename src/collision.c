@@ -537,32 +537,43 @@ bool collision_has_los(const LvtLevel *level, f32 ax, f32 az, f32 ay,
 
         if (best_wi < 0) return false; /* no wall crossed — stuck (shouldn't happen) */
 
-        /* Solid wall: blocks LOS */
+        const LvtWall *bw = &sec->walls[best_wi];
+
+        /* Solid wall (no adjoin): blocks LOS. */
         if (best_adj < 0 || best_adj >= (i32)level->sector_count) return false;
 
-        /* Only an intact glass window blocks LOS. A bare ADJOIN_MID adjoin is an
-         * OPEN portal (see [[project_collision]] — 0x2000 alone is not a fence),
-         * so a non-default mid texture must NOT block sight; that wrongly sealed
-         * off open canyon portals (CANYON sec 131, midtex=17) and stopped the
-         * player shooting enemies that were plainly visible across them. */
-        const LvtWall *bw = &sec->walls[best_wi];
-        if ((bw->flags & LVT_WALL_FLAG_ADJOIN_MID) &&
-            bw->is_window && !bw->window_broken)
+        /* Only an intact glass mask window blocks LOS. A bare open portal does
+         * not (0x2000 alone is not a fence). */
+        if (bw->is_window && !bw->window_broken)
             return false;
 
-        /* Check height at the portal — ray must fit through the opening */
-        const LvtSector *adj = &level->sectors[best_adj];
-        f32 portal_floor = (sec->floor_y > adj->floor_y) ? sec->floor_y : adj->floor_y;
-        f32 portal_ceil  = (sec->ceil_y  < adj->ceil_y)  ? sec->ceil_y  : adj->ceil_y;
-        /* Interpolate eye height along ray */
+        /* Height gate — the ray must clear an opening at the crossing point.
+         * Evaluate heights slope-aware AT the crossing (not the flat base), and
+         * consider BOTH the adjoin and the dadjoin openings: an arch / under-a-
+         * bridge shot passes through the LOWER (dadjoin) opening even though it
+         * would not fit the upper one. LOS succeeds if the ray fits EITHER. */
+        f32 hx = ax + best_t * rdx, hz = az + best_t * rdz;
         f32 eye_at_t = ay + best_t * (by - ay);
-        if (eye_at_t < portal_floor + 0.5f || eye_at_t > portal_ceil - 0.5f)
-            return false;
+        f32 sF = lvt_floor_at(sec, hx, hz), sC = lvt_ceil_at(sec, hx, hz);
 
-        /* Advance through portal */
-        cx = ax + best_t * rdx;
-        cz = az + best_t * rdz;
-        cur = best_adj;
+        i32 openings[2] = { best_adj, bw->dadjoin };
+        bool passed = false; i32 through = -1;
+        for (int oi = 0; oi < 2 && !passed; oi++) {
+            i32 as = openings[oi];
+            if (as < 0 || as >= (i32)level->sector_count) continue;
+            const LvtSector *adj = &level->sectors[as];
+            f32 aF = lvt_floor_at(adj, hx, hz), aC = lvt_ceil_at(adj, hx, hz);
+            f32 pf = (sF > aF) ? sF : aF;   /* opening bottom */
+            f32 pc = (sC < aC) ? sC : aC;   /* opening top */
+            if (pc <= pf) continue;         /* no opening here */
+            if (eye_at_t >= pf && eye_at_t <= pc) { passed = true; through = as; }
+        }
+        if (!passed) return false;
+
+        /* Advance through the opening the ray actually used. */
+        cx = hx;
+        cz = hz;
+        cur = through;
     }
     return false; /* too many portal crossings */
 }

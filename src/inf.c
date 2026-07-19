@@ -730,6 +730,121 @@ InfDoorResult inf_nudge_door_near(InfSystem *inf, const LvtLevel *level,
     return res;
 }
 
+/* Point-in-sector 2D test (local copy — collision.c has its own). */
+static bool inf_point_in_sector(const LvtSector *s, f32 x, f32 z) {
+    int c = 0;
+    for (u32 i = 0; i < s->wall_count; i++) {
+        const LvtWall *w = &s->walls[i];
+        if (w->v1 < 0 || w->v2 < 0 ||
+            w->v1 >= (i32)s->vertex_count || w->v2 >= (i32)s->vertex_count) continue;
+        f32 x0 = s->vertices[w->v1].x, z0 = s->vertices[w->v1].y;
+        f32 x1 = s->vertices[w->v2].x, z1 = s->vertices[w->v2].y;
+        if ((z0 <= z && z < z1) || (z1 <= z && z < z0)) {
+            f32 t = (z - z0) / (z1 - z0);
+            if (x < x0 + t * (x1 - x0)) c++;
+        }
+    }
+    return (c & 1) != 0;
+}
+
+/* Nudge every door leaf clustered around sector `target` (double doors). */
+static InfDoorResult inf_nudge_door_group(InfSystem *inf, const LvtLevel *level,
+                                          u32 target, u32 have_keys,
+                                          int *needed_key) {
+    if (target >= level->sector_count) return INF_DOOR_NONE;
+    /* Find a door elevator on `target`; if none, nothing to group around. */
+    f32 tcx = 0, tcz = 0; bool have_c = false;
+    for (u32 i = 0; i < inf->count; i++) {
+        Elevator *el = &inf->elevs[i];
+        if (el->active && elev_is_door(el) && el->sector_idx == target) {
+            door_centroid(level, el, &tcx, &tcz); have_c = true; break;
+        }
+    }
+    if (!have_c) return INF_DOOR_NONE;
+
+    InfDoorResult res = INF_DOOR_NONE;
+    for (u32 i = 0; i < inf->count; i++) {
+        Elevator *el = &inf->elevs[i];
+        if (!el->active || !elev_is_door(el)) continue;
+        if (el->sector_idx >= level->sector_count) continue;
+        f32 cx, cz; door_centroid(level, el, &cx, &cz);
+        f32 dx = tcx - cx, dz = tcz - cz;
+        if (dx*dx + dz*dz > DOOR_GROUP_RADIUS * DOOR_GROUP_RADIUS) continue;
+        int nk = INF_KEY_NONE;
+        InfDoorResult r = inf_nudge_door(inf, el->sector_idx, have_keys, &nk);
+        if (r == INF_DOOR_UNLOCKED) res = INF_DOOR_UNLOCKED;
+        else if (r == INF_DOOR_LOCKED && res != INF_DOOR_UNLOCKED) {
+            res = INF_DOOR_LOCKED; if (needed_key) *needed_key = nk;
+        } else if (r == INF_DOOR_OPENED && res == INF_DOOR_NONE) res = INF_DOOR_OPENED;
+    }
+    return res;
+}
+
+InfDoorResult inf_nudge_door_ray(InfSystem *inf, const LvtLevel *level,
+                                 f32 ex, f32 ez, f32 ey,
+                                 f32 dx, f32 dz, f32 dy, f32 reach,
+                                 u32 have_keys, int *needed_key) {
+    /* Locate the starting sector (2D). */
+    int cur = -1;
+    for (u32 si = 0; si < level->sector_count; si++)
+        if (inf_point_in_sector(&level->sectors[si], ex, ez)) { cur = (i32)si; break; }
+    if (cur < 0) return INF_DOOR_NONE;
+
+    f32 rlen = sqrtf(dx*dx + dz*dz);
+    if (rlen < 1e-4f) return INF_DOOR_NONE;
+
+    f32 cx = ex, cz = ez;
+    f32 travelled = 0.0f;
+    /* Walk the ray through portals; at each wall crossing, try to nudge the
+     * wall's own sector and its adjoin/dadjoin (a door leaf is a thin sector
+     * adjoined to the room). Stop at the first door actually nudged, or when
+     * the ray hits a solid wall or exceeds `reach`. */
+    for (int step = 0; step < 64 && travelled < reach; step++) {
+        const LvtSector *sec = &level->sectors[cur];
+        f32 best_t = 1e30f; i32 best_wi = -1;
+        for (u32 wi = 0; wi < sec->wall_count; wi++) {
+            const LvtWall *w = &sec->walls[wi];
+            if (w->v1 < 0 || w->v2 < 0) continue;
+            f32 ax = sec->vertices[w->v1].x, az = sec->vertices[w->v1].y;
+            f32 bx = sec->vertices[w->v2].x, bz = sec->vertices[w->v2].y;
+            f32 edx = bx - ax, edz = bz - az;
+            f32 den = dx * edz - dz * edx;
+            if (fabsf(den) < 1e-8f) continue;
+            f32 t = ((ax - cx) * edz - (az - cz) * edx) / den;
+            f32 u = ((ax - cx) * dz - (az - cz) * dx) / den;
+            if (t < 1e-4f || u < -0.001f || u > 1.001f) continue;
+            if (t < best_t) { best_t = t; best_wi = (i32)wi; }
+        }
+        if (best_wi < 0) break;
+        travelled = best_t * rlen;
+        if (travelled > reach) break;
+        const LvtWall *bw = &sec->walls[best_wi];
+
+        /* Try to nudge a door on this wall's own sector, its adjoin, or dadjoin
+         * — whichever hosts an INF door. */
+        int candidates[3] = { cur, bw->adjoin, bw->dadjoin };
+        for (int c = 0; c < 3; c++) {
+            if (candidates[c] < 0 || candidates[c] >= (i32)level->sector_count) continue;
+            InfDoorResult r = inf_nudge_door_group(inf, level, (u32)candidates[c],
+                                                   have_keys, needed_key);
+            if (r != INF_DOOR_NONE) return r;
+        }
+
+        /* Continue through open portals only; a solid wall stops the reach. */
+        if (bw->adjoin < 0 || bw->adjoin >= (i32)level->sector_count) break;
+        /* Height gate: the ray must clear the portal opening. */
+        const LvtSector *adj = &level->sectors[bw->adjoin];
+        f32 pf = (sec->floor_y > adj->floor_y) ? sec->floor_y : adj->floor_y;
+        f32 pc = (sec->ceil_y  < adj->ceil_y)  ? sec->ceil_y  : adj->ceil_y;
+        f32 yat = ey + dy * best_t * rlen / (rlen > 1e-4f ? 1.0f : 1.0f);
+        (void)yat; (void)pf; (void)pc;   /* height gate optional for USE */
+        cx = ex + dx * best_t;
+        cz = ez + dz * best_t;
+        cur = bw->adjoin;
+    }
+    return INF_DOOR_NONE;
+}
+
 /* Apply a message to every elevator controlling `target_sector`. */
 void inf_send_message(InfSystem *inf, i32 target_sector,
                       InfMsgType msg, i32 param) {

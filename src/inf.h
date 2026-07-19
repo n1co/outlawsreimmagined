@@ -251,6 +251,19 @@ InfDoorResult inf_nudge_door_near(InfSystem *inf, const LvtLevel *level,
                                   u32 have_keys, int *needed_key);
 
 /*
+ * Faithful USE: cast a ray from the eye (ex,ey,ez) along direction (dx,dy,dz)
+ * up to `reach` world units through the sector portal graph (Actor_NudgeTrace
+ * @0x446cc0). Nudge the door of the first wall's own sector or its adjoin/
+ * dadjoin — i.e. the door you are LOOKING at, at any distance within reach.
+ * This is how upstairs/interior doors open (proximity radius alone misses
+ * them). Returns the aggregated door result; fills *needed_key on LOCKED.
+ */
+InfDoorResult inf_nudge_door_ray(InfSystem *inf, const LvtLevel *level,
+                                 f32 ex, f32 ez, f32 ey,
+                                 f32 dx, f32 dz, f32 dy, f32 reach,
+                                 u32 have_keys, int *needed_key);
+
+/*
  * Automatic morph-door handling. An ENTER-mask door opens only while the player
  * is actually STANDING IN the door's own sector (the Outlaws EVENT_ENTER
  * semantics) — NOT merely near it, so building doors no longer swing open from

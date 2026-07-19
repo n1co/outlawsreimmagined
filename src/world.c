@@ -1128,8 +1128,12 @@ bool world_load(World *world, Archives *arc,
             world->inf.triggers[i].sector_idx == 0xFFFFFFFFu)
             world->inf_unresolved++;
 
-    /* Mark breakable glass windows: portal (adjoin) mask walls (flag bit 0x01)
-     * whose MID texture is a window (name contains "WIN"). */
+    /* Mark breakable glass windows. In Outlaws, only glass with a BREAK
+     * animation shatters when shot — those are .ATX animated textures (the
+     * shatter is a STOP-terminated frame sequence). Static painted windows
+     * (.PCX, e.g. GWWIN2.PCX on the HIDEOUT house) are part of the wall and
+     * are NOT breakable. So require a mask portal wall (flag bit 0x01) whose
+     * MID texture is an animated (.ATX) window — not merely a "WIN" name. */
     {
         u32 nwin = 0;
         for (u32 si = 0; si < world->lvt.sector_count; si++) {
@@ -1140,9 +1144,10 @@ bool world_load(World *world, Archives *arc,
                 i32 t = w->mid.tex_id;
                 if (t < 0 || t >= (i32)world->lvt.texture_count) continue;
                 const char *tn = world->lvt.textures[t];
-                if (strstr(tn, "WIN") || strstr(tn, "win") || strstr(tn, "Win")) {
-                    w->is_window = true; nwin++;
-                }
+                const char *ext = strrchr(tn, '.');
+                bool is_atx = ext && strcasecmp(ext, ".atx") == 0;
+                bool has_win = strcasestr(tn, "win") != NULL;
+                if (is_atx && has_win) { w->is_window = true; nwin++; }
             }
         }
         OL_LOG("Breakable glass windows: %u\n", nwin);

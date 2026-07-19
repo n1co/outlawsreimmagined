@@ -2195,10 +2195,26 @@ static void app_run(void) {
                 int needed = INF_KEY_NONE;
                 u32 keys = (u32)g_app.player.keys;
 
-                /* Nudge the nearest door by proximity (robust vs sector graph). */
-                InfDoorResult best = inf_nudge_door_near(
+                /* Faithful USE: raycast from the eye at the wall being looked
+                 * at and nudge the door across it (Actor_NudgeTrace@0x446cc0).
+                 * This opens interior/upstairs doors the old proximity radius
+                 * missed. Fall back to a short proximity nudge for doors you
+                 * stand right against without facing. */
+                Vec3 ueye = player_eye_pos(&g_app.player);
+                f32 ucp = cosf(g_app.player.pitch), usp = sinf(g_app.player.pitch);
+                f32 ucy = cosf(g_app.player.yaw),   usy = sinf(g_app.player.yaw);
+                Vec3 udir = { ucy*ucp, usp, usy*ucp };
+                InfDoorResult best = inf_nudge_door_ray(
                     &g_app.world.inf, &g_app.world.lvt,
-                    g_app.player.pos.x, g_app.player.pos.z, 22.0f, keys, &needed);
+                    ueye.x, ueye.z, ueye.y, udir.x, udir.z, udir.y,
+                    64.0f, keys, &needed);
+                if (best == INF_DOOR_NONE) {
+                    int nk2 = INF_KEY_NONE;
+                    InfDoorResult b2 = inf_nudge_door_near(
+                        &g_app.world.inf, &g_app.world.lvt,
+                        g_app.player.pos.x, g_app.player.pos.z, 12.0f, keys, &nk2);
+                    if (b2 != INF_DOOR_NONE) { best = b2; needed = nk2; }
+                }
 
                 /* USE also nudges scenery (msg 0x7D3, Actor_NudgeTrace
                  * @0x446cc0): SHOOT and NUDGE Inv_Object types react. */
@@ -2251,6 +2267,9 @@ static void app_run(void) {
                     const Elevator *el = &g_app.world.inf.elevs[ei];
                     if (el->just_triggered && el->sound_id)
                         audio_play(&g_app.audio, el->sound_id);
+                    if (getenv("OL_DOORLOG") && el->just_triggered)
+                        OL_LOG("DOORLOG nudged '%s' sec=%u result=%d\n",
+                               el->sector_name, el->sector_idx, best);
                 }
             }
         }
