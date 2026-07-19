@@ -999,8 +999,13 @@ bool renderer_build_level(Renderer *r, const LvtLevel *level, const InfSystem *i
             f32 x1 = sec->vertices[wall->v2].x;
             f32 z1 = sec->vertices[wall->v2].y;
 
-            /* Sky-boundary walls: invisible portals that outline the sky volume */
-            if (wall->flags & LVT_WALL_FLAG_SKY_BOUNDARY) continue;
+            /* NOTE: 0x20000 was previously treated as "SKY_BOUNDARY: skip this
+             * wall" — a GUESS (RENDER_ANALYSIS flagged it unconfirmed). But
+             * 12% of walls carry it, almost all adjoin portals with real
+             * textures; skipping them left huge floor-line sky-bleed (HIDEOUT
+             * house/courtyard). They render as normal geometry-driven portal
+             * walls; sky ceilings/floors are handled by the sky_both height
+             * rule below, not by dropping whole walls. */
 
             /* This sector's floor/ceiling at each wall endpoint (slope-aware) so
              * wall strips are trapezoids that meet the sloped flats seamlessly. */
