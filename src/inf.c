@@ -23,6 +23,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include <ctype.h>
 
 /* -------------------------------------------------------------------------
  * Tiny text parser (same style as obt.c)
@@ -126,6 +127,8 @@ bool inf_load(InfSystem *inf, const char *text, u32 text_len) {
     Tp t = { text, text + text_len };
     char tok[128];
     char pending_sector[64] = {0};  /* sector name from ITEM: SECTOR NAME: */
+    bool pending_is_line = false;   /* current ITEM is a LINE (vs SECTOR) */
+    u32  pending_num = 0;           /* ITEM NUM: #hex (wall id for LINE) */
 
     while (t.p < t.end) {
         if (!tp_tok(&t, tok, sizeof(tok))) break;
@@ -137,6 +140,8 @@ bool inf_load(InfSystem *inf, const char *text, u32 text_len) {
             tp_tok(&t, item_type, sizeof(item_type));  /* "SECTOR" or "LINE" */
             /* Read key-value pairs until SEQ or SEQEND */
             pending_sector[0] = '\0';
+            pending_is_line = (strcasecmp(item_type, "LINE") == 0);
+            pending_num = 0;
             while (t.p < t.end) {
                 const char *save = t.p;
                 tp_tok(&t, tok, sizeof(tok));
@@ -147,8 +152,19 @@ bool inf_load(InfSystem *inf, const char *text, u32 text_len) {
                 }
                 if (strcasecmp(tok, "NAME:") == 0) {
                     tp_tok(&t, pending_sector, sizeof(pending_sector));
+                } else if (strcasecmp(tok, "NUM:") == 0) {
+                    /* NUM: #A8B2 — wall id hash a LINE trigger attaches to.
+                     * The value starts with '#', which the generic tokenizer
+                     * would treat as a comment; read it raw here. Skip only
+                     * spaces/tabs (not newlines), then take the hex token. */
+                    while (t.p < t.end && (*t.p == ' ' || *t.p == '\t')) t.p++;
+                    if (t.p < t.end && *t.p == '#') t.p++;   /* hex prefix */
+                    char numtok[32]; int nn = 0;
+                    while (t.p < t.end && nn < 31 &&
+                           isxdigit((unsigned char)*t.p)) numtok[nn++] = *t.p++;
+                    numtok[nn] = '\0';
+                    pending_num = (u32)strtoul(numtok, NULL, 16);
                 }
-                /* Skip NUM: and other ITEM attributes */
             }
             continue;
         }
@@ -183,6 +199,8 @@ bool inf_load(InfSystem *inf, const char *text, u32 text_len) {
                 tr->event_mask = INF_EVENT_NUDGE; /* default: nudge */
                 tr->single = (strcasecmp(trig_type, "SINGLE") == 0);
                 snprintf(tr->sector_name, sizeof(tr->sector_name), "%s", pending_sector);
+                tr->is_line = pending_is_line;
+                tr->line_id = pending_num;
 
                 while (t.p < t.end) {
                     const char *save = t.p;
@@ -209,6 +227,22 @@ bool inf_load(InfSystem *inf, const char *text, u32 text_len) {
                         else if (strcasecmp(mt, "WAKEUP")     == 0) tr->msg = INF_MSG_WAKEUP;
                         else if (strcasecmp(mt, "USER_MSG")   == 0) { tr->msg = INF_MSG_USER_MSG; tr->msg_param = (i32)tp_float(&t); }
                         else if (strcasecmp(mt, "END_LEVEL")  == 0) tr->msg = INF_MSG_END_LEVEL;
+                        else if (strcasecmp(mt, "SPAWN_LEVEL") == 0) {
+                            /* SPAWN_LEVEL <level> [startpos] — load a mission
+                             * (OFFICE hub porches). */
+                            tr->msg = INF_MSG_SPAWN_LEVEL;
+                            tp_tok(&t, tr->spawn_level, sizeof(tr->spawn_level));
+                            /* Optional named start; stop before the next keyword. */
+                            const char *sv = t.p;
+                            char s2[32]; tp_tok(&t, s2, sizeof(s2));
+                            if (s2[0] && strcasecmp(s2, "EVENT_MASK:") != 0 &&
+                                strcasecmp(s2, "CLIENT:") != 0 &&
+                                strcasecmp(s2, "SEQEND") != 0 &&
+                                strcasecmp(s2, "CLASS:") != 0 &&
+                                strcasecmp(s2, "ITEM:") != 0)
+                                snprintf(tr->spawn_start, sizeof(tr->spawn_start), "%s", s2);
+                            else t.p = sv;   /* no startpos: rewind */
+                        }
                         else if (strcasecmp(mt, "DONE")       == 0) tr->msg = INF_MSG_DONE;
                     }
                     /* Ignore OBJECT:, OBJECT_EXCLUDE:, CENTER:, etc. */
@@ -891,6 +925,125 @@ void inf_send_message(InfSystem *inf, i32 target_sector,
     }
 }
 
+/* Resolve each LINE trigger's segment endpoints from its wall NUM hash. */
+void inf_resolve_lines(InfSystem *inf, const LvtLevel *level) {
+    for (u32 i = 0; i < inf->trigger_count; i++) {
+        InfTrigger *tr = &inf->triggers[i];
+        if (!tr->is_line || tr->line_resolved || tr->line_id == 0) continue;
+        for (u32 si = 0; si < level->sector_count && !tr->line_resolved; si++) {
+            const LvtSector *s = &level->sectors[si];
+            for (u32 wi = 0; wi < s->wall_count; wi++) {
+                const LvtWall *w = &s->walls[wi];
+                if (w->id != tr->line_id) continue;
+                if (w->v1 < 0 || w->v2 < 0) continue;
+                tr->lx0 = s->vertices[w->v1].x; tr->lz0 = s->vertices[w->v1].y;
+                tr->lx1 = s->vertices[w->v2].x; tr->lz1 = s->vertices[w->v2].y;
+                tr->line_resolved = true;
+                break;
+            }
+        }
+    }
+}
+
+/* 2D segment-segment intersection test. */
+static bool segs_cross(f32 ax, f32 az, f32 bx, f32 bz,
+                       f32 cx, f32 cz, f32 dx, f32 dz) {
+    f32 d1x = bx - ax, d1z = bz - az;
+    f32 d2x = dx - cx, d2z = dz - cz;
+    f32 den = d1x * d2z - d1z * d2x;
+    if (fabsf(den) < 1e-9f) return false;
+    f32 t = ((cx - ax) * d2z - (cz - az) * d2x) / den;
+    f32 u = ((cx - ax) * d1z - (cz - az) * d1x) / den;
+    return t >= 0.0f && t <= 1.0f && u >= 0.0f && u <= 1.0f;
+}
+
+static void inf_fire_line(InfSystem *inf, InfTrigger *tr);
+
+void inf_check_line_cross(InfSystem *inf, f32 x0, f32 z0, f32 x1, f32 z1) {
+    /* No movement → nothing crossed. */
+    if (fabsf(x1 - x0) < 1e-5f && fabsf(z1 - z0) < 1e-5f) return;
+    for (u32 i = 0; i < inf->trigger_count; i++) {
+        InfTrigger *tr = &inf->triggers[i];
+        if (!tr->active || !tr->is_line || !tr->line_resolved) continue;
+        if (tr->single && tr->fired_once) continue;
+        if (!segs_cross(x0, z0, x1, z1, tr->lx0, tr->lz0, tr->lx1, tr->lz1))
+            continue;
+        inf_fire_line(inf, tr);
+    }
+}
+
+/* Fire one line trigger's message (shared by cross + nudge paths). */
+static void inf_fire_line(InfSystem *inf, InfTrigger *tr) {
+    tr->fired_once = true;
+    if (tr->to_system) {
+        switch (tr->msg) {
+        case INF_MSG_USER_MSG:  inf->pending_user_msg = tr->msg_param; break;
+        case INF_MSG_END_LEVEL: inf->pending_end_level = true; break;
+        case INF_MSG_SPAWN_LEVEL:
+            snprintf(inf->pending_spawn_level, sizeof(inf->pending_spawn_level),
+                     "%s", tr->spawn_level);
+            snprintf(inf->pending_spawn_start, sizeof(inf->pending_spawn_start),
+                     "%s", tr->spawn_start);
+            break;
+        default: break;
+        }
+    } else {
+        inf_send_message(inf, tr->client_sector, tr->msg, tr->msg_param);
+    }
+}
+
+bool inf_fire_line_ray(InfSystem *inf, const LvtLevel *level,
+                       f32 ex, f32 ez, f32 dx, f32 dz, f32 reach, u32 event_bit) {
+    int cur = -1;
+    for (u32 si = 0; si < level->sector_count; si++)
+        if (inf_point_in_sector(&level->sectors[si], ex, ez)) { cur = (i32)si; break; }
+    if (cur < 0) return false;
+    f32 rlen = sqrtf(dx*dx + dz*dz);
+    if (rlen < 1e-4f) return false;
+
+    f32 cx = ex, cz = ez, travelled = 0.0f;
+    bool fired = false;
+    for (int step = 0; step < 64 && travelled < reach; step++) {
+        const LvtSector *sec = &level->sectors[cur];
+        f32 best_t = 1e30f; i32 best_wi = -1;
+        for (u32 wi = 0; wi < sec->wall_count; wi++) {
+            const LvtWall *w = &sec->walls[wi];
+            if (w->v1 < 0 || w->v2 < 0) continue;
+            f32 ax = sec->vertices[w->v1].x, az = sec->vertices[w->v1].y;
+            f32 bx = sec->vertices[w->v2].x, bz = sec->vertices[w->v2].y;
+            f32 edx = bx - ax, edz = bz - az;
+            f32 den = dx * edz - dz * edx;
+            if (fabsf(den) < 1e-8f) continue;
+            f32 t = ((ax - cx) * edz - (az - cz) * edx) / den;
+            f32 u = ((ax - cx) * dz - (az - cz) * dx) / den;
+            if (t < 1e-4f || u < -0.001f || u > 1.001f) continue;
+            if (t < best_t) { best_t = t; best_wi = (i32)wi; }
+        }
+        if (best_wi < 0) break;
+        travelled = best_t * rlen;
+        if (travelled > reach) break;
+        const LvtWall *bw = &sec->walls[best_wi];
+
+        /* Fire any line trigger attached to this wall (by id) for the given
+         * event bit (NUDGE for USE, SHOOT for a bullet). */
+        for (u32 i = 0; i < inf->trigger_count; i++) {
+            InfTrigger *tr = &inf->triggers[i];
+            if (!tr->active || !tr->is_line) continue;
+            if (tr->single && tr->fired_once) continue;
+            if (tr->line_id != bw->id) continue;
+            if (!(tr->event_mask & event_bit)) continue;
+            inf_fire_line(inf, tr);
+            fired = true;
+        }
+        if (fired) return true;
+        /* Continue through open portals only. */
+        if (bw->adjoin < 0 || bw->adjoin >= (i32)level->sector_count) break;
+        cx = ex + dx * best_t; cz = ez + dz * best_t;
+        cur = bw->adjoin;
+    }
+    return fired;
+}
+
 u32 inf_fire_triggers(InfSystem *inf, u32 sector_idx, u32 event_bits) {
     u32 fired = 0;
     for (u32 i = 0; i < inf->trigger_count; i++) {
@@ -906,6 +1059,12 @@ u32 inf_fire_triggers(InfSystem *inf, u32 sector_idx, u32 event_bits) {
             switch (tr->msg) {
             case INF_MSG_USER_MSG:  inf->pending_user_msg = tr->msg_param; break;
             case INF_MSG_END_LEVEL: inf->pending_end_level = true; break;
+            case INF_MSG_SPAWN_LEVEL:
+                snprintf(inf->pending_spawn_level, sizeof(inf->pending_spawn_level),
+                         "%s", tr->spawn_level);
+                snprintf(inf->pending_spawn_start, sizeof(inf->pending_spawn_start),
+                         "%s", tr->spawn_start);
+                break;
             default: break;
             }
         } else {

@@ -1067,6 +1067,7 @@ bool world_load(World *world, Archives *arc,
         if (inf_data && inf_size > 0) {
             inf_load(&world->inf, (const char *)inf_data, inf_size);
             inf_resolve_sectors(&world->inf, &world->lvt);
+            inf_resolve_lines(&world->inf, &world->lvt);   /* LINE trigger walls */
             OL_LOG("INF loaded: %u elevators/doors\n", world->inf.count);
         }
     }

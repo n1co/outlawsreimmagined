@@ -1385,6 +1385,11 @@ static void fire_one_trace(Vec3 eye, f32 yaw, f32 pitch, f32 max_dist,
 
     break_glass_windows(eye, dir);
     fire_shoot_triggers(eye, dir);
+    /* Shooting an OFFICE mission poster (an interaction LINE trigger) launches
+     * its mission. Match any interaction bit (nudge-front/back or shoot). */
+    inf_fire_line_ray(&g_app.world.inf, &g_app.world.lvt,
+                      eye.x, eye.z, dir.x, dir.z, 512.0f,
+                      INF_EVENT_ENTER | INF_EVENT_NUDGE | INF_EVENT_SHOOT);
 
     f32 de, dp;
     int ei = entity_raycast(&g_app.world.entities, &g_app.world.lvt,
@@ -2181,6 +2186,11 @@ static void app_run(void) {
             }
         }
 
+        /* LINE triggers: fire when the player's movement segment crosses a
+         * trigger line (OFFICE mission-hub porches → SPAWN_LEVEL, secrets). */
+        inf_check_line_cross(&g_app.world.inf, pre_move_pos.x, pre_move_pos.z,
+                             g_app.player.pos.x, g_app.player.pos.z);
+
         inf_update(&g_app.world.inf, dt, &g_app.world.lvt);
         /* Sync scroll UV offsets every frame (no rebuild needed for scroll) */
         renderer_sync_scroll(&g_app.renderer, &g_app.world.inf);
@@ -2224,6 +2234,12 @@ static void app_run(void) {
                     f32 cy2 = cosf(g_app.player.yaw),   sy2 = sinf(g_app.player.yaw);
                     Vec3 fdir = { cy2*cp2, sp2, sy2*cp2 };
                     entity_nudge(&g_app.world.entities, eye, fdir, 12.0f);
+                    /* USE a wall LINE trigger (nudge-masked switches). The
+                     * OFFICE mission posters are SHOOT-masked (fired from the
+                     * fire path), not USE. */
+                    inf_fire_line_ray(&g_app.world.inf, &g_app.world.lvt,
+                                      eye.x, eye.z, fdir.x, fdir.z, 24.0f,
+                                      INF_EVENT_ENTER | INF_EVENT_NUDGE);
                 }
 
                 /* Also fire NUDGE triggers in the current + adjacent sectors. */
@@ -2286,6 +2302,19 @@ static void app_run(void) {
                          "Message %d", g_app.world.inf.pending_user_msg);
             g_app.message_timer = 3.0f;
             g_app.world.inf.pending_user_msg = -1;
+        }
+        /* SPAWN_LEVEL: an OFFICE-hub porch (or similar) launched a mission. */
+        if (g_app.world.inf.pending_spawn_level[0]) {
+            char lvl[32];
+            snprintf(lvl, sizeof(lvl), "%s", g_app.world.inf.pending_spawn_level);
+            g_app.world.inf.pending_spawn_level[0] = '\0';
+            g_app.world.inf.pending_spawn_start[0] = '\0';
+            OL_LOG("SPAWN_LEVEL -> loading '%s'\n", lvl);
+            g_app.campaign_active = false;   /* single mission from the hub */
+            if (load_level_runtime(lvl)) {
+                input_capture_mouse(&g_app.input, true);
+                goto render_frame;   /* skip the rest of this stale frame */
+            }
         }
         if (g_app.world.inf.pending_end_level) {
             g_app.world.inf.pending_end_level = false;
@@ -2807,6 +2836,28 @@ int main(int argc, char **argv) {
         return code;
     }
     if (g_app.check_mode) {
+        /* OL_LINETEST: verify LINE-trigger SPAWN_LEVEL — cross each resolved
+         * line trigger's segment perpendicularly and report what fires. */
+        if (getenv("OL_LINETEST")) {
+            InfSystem *inf = &g_app.world.inf;
+            for (u32 i = 0; i < inf->trigger_count; i++) {
+                InfTrigger *tr = &inf->triggers[i];
+                if (!tr->is_line) continue;
+                OL_LOG("LINETEST trig '%s' line=%#x resolved=%d msg=%d spawn='%s' mask=%#x\n",
+                       tr->sector_name, tr->line_id, tr->line_resolved,
+                       tr->msg, tr->spawn_level, tr->event_mask);
+                if (!tr->line_resolved) continue;
+                /* midpoint + normal, cross from one side to the other */
+                f32 mx = (tr->lx0 + tr->lx1) * 0.5f, mz = (tr->lz0 + tr->lz1) * 0.5f;
+                f32 dx = tr->lx1 - tr->lx0, dz = tr->lz1 - tr->lz0;
+                f32 L = sqrtf(dx*dx + dz*dz); if (L < 1e-4f) continue;
+                f32 nx = -dz / L, nz = dx / L;
+                inf->pending_spawn_level[0] = '\0';
+                inf_check_line_cross(inf, mx - nx*2, mz - nz*2, mx + nx*2, mz + nz*2);
+                OL_LOG("  -> crossed: pending_spawn='%s' user_msg=%d\n",
+                       inf->pending_spawn_level, inf->pending_user_msg);
+            }
+        }
         /* OL_WEAPTEST: exercise the projectile/dynamite pipeline headlessly. */
         if (getenv("OL_WEAPTEST")) {
             Vec3 pp = g_app.world.player_start;

@@ -166,6 +166,7 @@ typedef enum {
     INF_MSG_WAKEUP,
     INF_MSG_USER_MSG,
     INF_MSG_END_LEVEL,
+    INF_MSG_SPAWN_LEVEL,   /* Load another level (OFFICE mission-hub porches) */
     INF_MSG_DONE,
 } InfMsgType;
 
@@ -190,6 +191,18 @@ typedef struct {
     bool       to_system;          /* CLIENT: SYSTEM */
     bool       fired_once;         /* For SINGLE triggers */
     bool       single;            /* Fires only once */
+
+    /* LINE triggers (ITEM: LINE): attached to a wall (by NUM hash id). Fire
+     * when the player CROSSES the wall's 2D segment. Used by the OFFICE
+     * mission hub — crossing a porch line loads a mission (SPAWN_LEVEL). */
+    bool       is_line;            /* ITEM: LINE (vs ITEM: SECTOR) */
+    u32        line_id;            /* NUM: #hex = wall id to attach to */
+    bool       line_resolved;      /* Endpoints resolved from the wall */
+    f32        lx0, lz0, lx1, lz1; /* Line segment endpoints (world XZ) */
+
+    /* SPAWN_LEVEL target (INF_MSG_SPAWN_LEVEL). */
+    char       spawn_level[32];    /* Level name to load */
+    char       spawn_start[32];    /* Named start position (optional) */
 } InfTrigger;
 
 typedef struct {
@@ -204,6 +217,9 @@ typedef struct {
     i32      pending_lock_msg;     /* LOCAL.MSG id for a locked door nudge, -1 = none */
     i32      pending_explode_sector;/* EXPLODE elevator fired this frame, -1 = none */
     bool     pending_end_level;    /* END_LEVEL fired */
+    /* SPAWN_LEVEL fired this frame (OFFICE hub) — game loop loads it. */
+    char     pending_spawn_level[32];
+    char     pending_spawn_start[32];
 } InfSystem;
 
 /* Initialize INF system */
@@ -214,6 +230,23 @@ bool inf_load(InfSystem *inf, const char *text, u32 text_len);
 
 /* Update all elevators (call each frame with dt) */
 void inf_update(InfSystem *inf, f32 dt, LvtLevel *level);
+
+/* Resolve LINE triggers' endpoints from their wall NUM hash (call after load,
+ * once the level geometry is available). */
+void inf_resolve_lines(InfSystem *inf, const LvtLevel *level);
+
+/* Fire LINE triggers whose segment is crossed by the player's move from
+ * (x0,z0) to (x1,z1) this frame (mission-hub porches, secret triggers).
+ * Sets pending_spawn_level / pending_user_msg as appropriate. */
+void inf_check_line_cross(InfSystem *inf, f32 x0, f32 z0, f32 x1, f32 z1);
+
+/* Raycast from the eye and fire any LINE trigger attached to the wall being
+ * looked at whose EVENT_MASK includes `event_bit`. The OFFICE mission posters
+ * are SHOOT line triggers — shooting the poster launches its mission; call
+ * with INF_EVENT_SHOOT from the fire path (and INF_EVENT_NUDGE from USE).
+ * Returns true if a line trigger fired. */
+bool inf_fire_line_ray(InfSystem *inf, const LvtLevel *level,
+                       f32 ex, f32 ez, f32 dx, f32 dz, f32 reach, u32 event_bit);
 
 /* Try to trigger an elevator by sector index.
  * Called when player presses USE near a door/elevator. */
