@@ -1,5 +1,11 @@
 /*
- * debug_ui.cpp - ImGui debug overlay implementation
+ * debug_ui.cpp - ImGui debug overlay (multi-window, FPS graph, level inspector)
+ *
+ * Robustness note: the game uses SDL RELATIVE mouse mode for FPS look. ImGui
+ * needs ABSOLUTE mouse. While the overlay is visible we force absolute mode
+ * every frame (right at NewFrame) so clicks/scroll always land — the previous
+ * version intermittently lost clicks / lagged scroll because relative mode
+ * left ImGui with a stale/garbage cursor position.
  */
 #include "debug_ui.h"
 #include "imgui/imgui.h"
@@ -21,9 +27,11 @@ void debug_ui_init(SDL_Window *window, SDL_GLContext gl_ctx) {
 
     ImGui::StyleColorsDark();
     ImGuiStyle &style = ImGui::GetStyle();
-    style.Alpha = 0.9f;
-    style.WindowRounding = 6.0f;
-    style.FrameRounding = 3.0f;
+    style.Alpha = 0.95f;
+    style.WindowRounding = 5.0f;
+    style.FrameRounding  = 3.0f;
+    style.GrabRounding   = 3.0f;
+    style.WindowBorderSize = 1.0f;
 
     ImGui_ImplSDL2_InitForOpenGL(window, gl_ctx);
     ImGui_ImplOpenGL3_Init("#version 330");
@@ -38,12 +46,13 @@ void debug_ui_shutdown(void) {
 void debug_ui_process_event(SDL_Event *event) {
     ImGui_ImplSDL2_ProcessEvent(event);
 
-    /* INSERT key toggles debug UI */
-    if (event->type == SDL_KEYDOWN && event->key.keysym.scancode == SDL_SCANCODE_INSERT) {
+    /* INSERT (and F1) toggles debug UI */
+    if (event->type == SDL_KEYDOWN &&
+        (event->key.keysym.scancode == SDL_SCANCODE_INSERT ||
+         event->key.keysym.scancode == SDL_SCANCODE_F1)) {
         g_debug.visible = !g_debug.visible;
-        /* Release mouse when debug UI opens */
         if (g_debug.visible)
-            SDL_SetRelativeMouseMode(SDL_FALSE);
+            SDL_SetRelativeMouseMode(SDL_FALSE);  /* free cursor for the panels */
     }
 }
 
@@ -52,127 +61,193 @@ bool debug_ui_wants_mouse(void) {
     return ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureMouse;
 }
 
+void debug_ui_push_fps(float fps) {
+    int cap = (int)(sizeof(g_debug.fps_hist) / sizeof(g_debug.fps_hist[0]));
+    g_debug.fps_hist[g_debug.fps_hist_head] = fps;
+    g_debug.fps_hist_head = (g_debug.fps_hist_head + 1) % cap;
+    if (g_debug.fps_hist_count < cap) g_debug.fps_hist_count++;
+}
+
+/* Ring buffer → linear array for ImGui::PlotLines (oldest→newest). */
+static float s_fps_plot[128];
+static int fps_plot_fill(void) {
+    int cap = (int)(sizeof(g_debug.fps_hist) / sizeof(g_debug.fps_hist[0]));
+    int n = g_debug.fps_hist_count;
+    for (int i = 0; i < n; i++) {
+        int idx = (g_debug.fps_hist_head - n + i + 2 * cap) % cap;
+        s_fps_plot[i] = g_debug.fps_hist[idx];
+    }
+    return n;
+}
+
 void debug_ui_render(void) {
     if (!g_debug.visible) return;
+
+    /* Force absolute mouse each frame while the overlay is up (see note). */
+    if (SDL_GetRelativeMouseMode() == SDL_TRUE)
+        SDL_SetRelativeMouseMode(SDL_FALSE);
 
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplSDL2_NewFrame();
     ImGui::NewFrame();
 
-    /* ---- Main debug window ---- */
+    const ImGuiWindowFlags WF = ImGuiWindowFlags_NoCollapse;
+
+    /* ---- Performance (top-left) ---- */
     ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(320, 400), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("Debug Menu (INSERT to toggle)")) {
-
-        /* Performance */
-        ImGui::Text("FPS: %.1f (%.2f ms)", g_debug.fps, g_debug.dt * 1000.0f);
+    ImGui::SetNextWindowSize(ImVec2(300, 170), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Performance", nullptr, WF)) {
+        ImVec4 fc = g_debug.fps >= 55 ? ImVec4(0.4f,1,0.4f,1)
+                  : g_debug.fps >= 30 ? ImVec4(1,0.9f,0.3f,1)
+                                      : ImVec4(1,0.4f,0.4f,1);
+        ImGui::TextColored(fc, "%.0f FPS", g_debug.fps);
+        ImGui::SameLine();
+        ImGui::Text("(%.2f ms)", g_debug.dt * 1000.0f);
+        int n = fps_plot_fill();
+        if (n > 1) {
+            char ov[32]; snprintf(ov, sizeof(ov), "%.0f fps", g_debug.fps);
+            ImGui::PlotLines("##fps", s_fps_plot, n, 0, ov,
+                             0.0f, 120.0f, ImVec2(-1, 70));
+        }
         ImGui::Text("Draw calls: %d", g_debug.draw_calls);
+    }
+    ImGui::End();
+
+    /* ---- Player (left, under perf) ---- */
+    ImGui::SetNextWindowPos(ImVec2(10, 190), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(300, 210), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Player", nullptr, WF)) {
+        ImGui::Text("Pos  (%.1f, %.1f, %.1f)",
+                    g_debug.player_x, g_debug.player_y, g_debug.player_z);
+        ImGui::Text("Yaw %.1f°  Pitch %.1f°",
+                    g_debug.player_yaw * 57.2958f, g_debug.player_pitch * 57.2958f);
+        float spd = /* horizontal speed */
+            (float)__builtin_sqrtf(g_debug.player_vx*g_debug.player_vx +
+                                   g_debug.player_vz*g_debug.player_vz);
+        ImGui::Text("Vel  (%.1f, %.1f, %.1f)  |xz|=%.1f",
+                    g_debug.player_vx, g_debug.player_vy, g_debug.player_vz, spd);
+        ImGui::Text("Sector %d  floor %.1f  ceil %.1f",
+                    g_debug.player_sector, g_debug.sector_floor, g_debug.sector_ceil);
+        ImGui::Text("Eye %.2f   %s   %s",
+                    g_debug.eye_height,
+                    g_debug.on_ground ? "grounded" : "AIRBORNE",
+                    g_debug.crouching ? "CROUCH" : "stand");
         ImGui::Separator();
+        int hp = g_debug.player_health;
+        ImVec4 hc = hp > 50 ? ImVec4(0.4f,1,0.4f,1)
+                  : hp > 20 ? ImVec4(1,0.9f,0.3f,1) : ImVec4(1,0.4f,0.4f,1);
+        ImGui::TextColored(hc, "Health %d", hp);
+        static const char *wnames[9] = {"Fist","Pistol","Rifle","Shotgun",
+            "Dbl.Sgun","Sawed","Dynamite","Knife","Gatling"};
+        int wi = g_debug.weapon_idx;
+        ImGui::Text("Weapon: %s  (%d/%d)",
+                    (wi>=0 && wi<9) ? wnames[wi] : "?",
+                    g_debug.weapon_clip, g_debug.weapon_reserve);
+    }
+    ImGui::End();
 
-        /* Player info */
-        if (ImGui::CollapsingHeader("Player Info", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::Text("Position: (%.1f, %.1f, %.1f)",
-                        g_debug.player_x, g_debug.player_y, g_debug.player_z);
-            ImGui::Text("Yaw: %.1f  Pitch: %.1f",
-                        g_debug.player_yaw * 57.2958f,
-                        g_debug.player_pitch * 57.2958f);
-            ImGui::Text("Sector: %d", g_debug.player_sector);
-            ImGui::Text("Health: %d", g_debug.player_health);
-        }
+    /* ---- Looking At (crosshair inspector) ---- */
+    ImGui::SetNextWindowPos(ImVec2(10, 405), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(300, 90), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Looking At", nullptr, WF)) {
+        ImVec4 lc = g_debug.look_is_door ? ImVec4(0.5f,0.8f,1,1)
+                  : g_debug.look_enemy >= 0 ? ImVec4(1,0.6f,0.5f,1)
+                                            : ImVec4(0.85f,0.85f,0.85f,1);
+        ImGui::TextColored(lc, "%s", g_debug.look_desc[0] ? g_debug.look_desc : "(nothing)");
+        if (g_debug.look_dist > 0)
+            ImGui::Text("dist %.1f   sector %d", g_debug.look_dist, g_debug.look_sector);
+    }
+    ImGui::End();
 
-        /* Level / mission info */
-        if (ImGui::CollapsingHeader("Level / Mission", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::Text("Map: %s", g_debug.map_name[0] ? g_debug.map_name : "(none)");
-            if (g_debug.campaign_active)
-                ImGui::Text("Story: mission %d / %d",
-                            g_debug.campaign_mission, g_debug.campaign_total);
-            else
-                ImGui::TextDisabled("Single map (not campaign)");
-            ImGui::Separator();
-            if (g_debug.has_boss) {
-                ImGui::Text("Objective: %s",
-                            g_debug.objective[0] ? g_debug.objective : "(none)");
-                ImVec4 bc = g_debug.boss_dead  ? ImVec4(0.4f,1,0.4f,1)
-                          : g_debug.boss_spawned ? ImVec4(1,0.5f,0.3f,1)
-                          : ImVec4(0.7f,0.7f,0.7f,1);
-                ImGui::TextColored(bc, "Boss: %s",
-                    g_debug.boss_dead ? "DEFEATED"
-                    : g_debug.boss_spawned ? "ACTIVE" : "dormant");
-            } else {
-                ImGui::TextDisabled("No boss objective");
-            }
-            ImGui::TextColored(
-                g_debug.mission_complete ? ImVec4(0.4f,1,0.4f,1) : ImVec4(1,1,1,1),
-                "Status: %s", g_debug.mission_complete ? "COMPLETE" : "in progress");
-            ImGui::Separator();
-            ImGui::Text("Enemies: %d / %d alive",
-                        g_debug.enemies_alive, g_debug.enemies_total);
-            ImGui::Text("Items left: %d", g_debug.items_alive);
-            ImGui::Text("Sectors: %d   Entities: %d",
-                        g_debug.sector_count, g_debug.entity_count);
-        }
-
+    /* ---- Level / Mission (top-right) ---- */
+    ImGui::SetNextWindowPos(ImVec2(320, 10), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(320, 260), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Level / Mission", nullptr, WF)) {
+        ImGui::Text("Map: %s", g_debug.map_name[0] ? g_debug.map_name : "(none)");
+        static const char *dnames[5] = {"?","Easy","Medium","Hard","Hardest"};
+        int d = (g_debug.difficulty>=1 && g_debug.difficulty<=4) ? g_debug.difficulty : 0;
+        ImGui::Text("Difficulty: %s", dnames[d]);
+        if (g_debug.campaign_active)
+            ImGui::Text("Story: mission %d / %d",
+                        g_debug.campaign_mission, g_debug.campaign_total);
+        else
+            ImGui::TextDisabled("Single map (not campaign)");
         ImGui::Separator();
-
-        /* Render options */
-        if (ImGui::CollapsingHeader("Render Options", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::Checkbox("Wireframe", &g_debug.wireframe);
+        if (g_debug.has_boss) {
+            ImGui::TextWrapped("Objective: %s",
+                        g_debug.objective[0] ? g_debug.objective : "(none)");
+            ImVec4 bc = g_debug.boss_dead  ? ImVec4(0.4f,1,0.4f,1)
+                      : g_debug.boss_spawned ? ImVec4(1,0.5f,0.3f,1)
+                      : ImVec4(0.7f,0.7f,0.7f,1);
+            ImGui::TextColored(bc, "Boss: %s",
+                g_debug.boss_dead ? "DEFEATED"
+                : g_debug.boss_spawned ? "ACTIVE" : "dormant");
+        } else {
+            ImGui::TextDisabled("No boss objective");
         }
-
+        ImGui::TextColored(
+            g_debug.mission_complete ? ImVec4(0.4f,1,0.4f,1) : ImVec4(1,1,1,1),
+            "Status: %s", g_debug.mission_complete ? "COMPLETE" : "in progress");
         ImGui::Separator();
-
-        /* Cheats */
-        if (ImGui::CollapsingHeader("Cheats", ImGuiTreeNodeFlags_DefaultOpen)) {
-            ImGui::Checkbox("God Mode", &g_debug.godmode);
-            ImGui::Checkbox("Noclip", &g_debug.noclip);
-            if (ImGui::Button("Give All Weapons + Ammo"))
-                g_debug.give_all_weapons = true;
-            if (ImGui::Button("Full Health"))
-                g_debug.player_health = 100; /* Game loop reads this */
-        }
-
+        ImGui::Text("Enemies: %d / %d alive", g_debug.enemies_alive, g_debug.enemies_total);
+        ImGui::Text("Items left: %d", g_debug.items_alive);
+        ImGui::Text("Sectors: %d   Entities: %d",
+                    g_debug.sector_count, g_debug.entity_count);
         ImGui::Separator();
-
-        /* Inventory — grant keys / tools (bit = 1 << InfKeyType).
-         * STEEL=1 IRON=2 BRASS=3 ROUND=4 SQUARE=5 CROWBAR=6 GENERIC=7
-         * SHOVEL=8 BADGE=9. Game loop ORs give_items into player.keys. */
-        if (ImGui::CollapsingHeader("Inventory (grant items)",
-                                    ImGuiTreeNodeFlags_DefaultOpen)) {
-            struct { const char *label; int bit; } items[] = {
-                { "Steel Key",       1 << 1 },
-                { "Iron Key",        1 << 2 },
-                { "Brass Key",       1 << 3 },
-                { "Round Stone Key", 1 << 4 },
-                { "Square Stone Key",1 << 5 },
-                { "Crowbar",         1 << 6 },
-                { "Shovel",          1 << 8 },
-                { "Sheriff's Badge", 1 << 9 },
-            };
-            for (int i = 0; i < 8; i++) {
-                if (ImGui::Button(items[i].label))
-                    g_debug.give_items |= items[i].bit;
-                if ((i & 1) == 0) ImGui::SameLine();
-            }
-            ImGui::NewLine();
-            if (ImGui::Button("Give ALL Keys + Tools")) {
-                for (int i = 0; i < 8; i++) g_debug.give_items |= items[i].bit;
-            }
-            /* Held items (read-back). */
-            ImGui::Text("Held:");
-            bool any = false;
-            for (int i = 0; i < 8; i++) {
-                if (g_debug.player_keys & items[i].bit) {
-                    ImGui::SameLine(); ImGui::TextColored(
-                        ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", items[i].label);
-                    any = true;
-                }
-            }
-            if (!any) { ImGui::SameLine(); ImGui::TextDisabled("(none)"); }
+        if (ImGui::Button("Reload Level")) g_debug.req_reload_level = 1;
+        ImGui::SameLine();
+        ImGui::TextDisabled("(set difficulty below reloads)");
+        for (int i = 1; i <= 4; i++) {
+            if (i > 1) ImGui::SameLine();
+            char b[16]; snprintf(b, sizeof(b), "%s", dnames[i]);
+            if (ImGui::Button(b)) g_debug.req_set_difficulty = i;
         }
     }
     ImGui::End();
 
-    /* Render ImGui */
+    /* ---- Render / Cheats (right, under level) ---- */
+    ImGui::SetNextWindowPos(ImVec2(320, 280), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(320, 300), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Render / Cheats", nullptr, WF)) {
+        ImGui::Checkbox("Wireframe", &g_debug.wireframe);
+        ImGui::Separator();
+        ImGui::Checkbox("God Mode", &g_debug.godmode);
+        ImGui::Checkbox("Noclip", &g_debug.noclip);
+        if (ImGui::Button("Give All Weapons + Ammo")) g_debug.give_all_weapons = true;
+        ImGui::SameLine();
+        if (ImGui::Button("Full Health")) g_debug.player_health = 100;
+        ImGui::Separator();
+        ImGui::TextDisabled("Inventory (grant items)");
+        struct { const char *label; int bit; } items[] = {
+            { "Steel Key",       1 << 1 },
+            { "Iron Key",        1 << 2 },
+            { "Brass Key",       1 << 3 },
+            { "Round Stone Key", 1 << 4 },
+            { "Square Stone Key",1 << 5 },
+            { "Crowbar",         1 << 6 },
+            { "Shovel",          1 << 8 },
+            { "Sheriff's Badge", 1 << 9 },
+        };
+        for (int i = 0; i < 8; i++) {
+            if (ImGui::Button(items[i].label)) g_debug.give_items |= items[i].bit;
+            if ((i & 1) == 0) ImGui::SameLine();
+        }
+        ImGui::NewLine();
+        if (ImGui::Button("Give ALL Keys + Tools"))
+            for (int i = 0; i < 8; i++) g_debug.give_items |= items[i].bit;
+        ImGui::Text("Held:");
+        bool any = false;
+        for (int i = 0; i < 8; i++) {
+            if (g_debug.player_keys & items[i].bit) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.4f,1,0.4f,1), "%s", items[i].label);
+                any = true;
+            }
+        }
+        if (!any) { ImGui::SameLine(); ImGui::TextDisabled("(none)"); }
+    }
+    ImGui::End();
+
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 }

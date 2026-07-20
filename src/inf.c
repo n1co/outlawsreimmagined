@@ -1342,6 +1342,22 @@ bool inf_is_morph_door(const InfSystem *inf, u32 sector_idx) {
     return false;
 }
 
+const char *inf_door_name_for_sector(const InfSystem *inf, u32 sector_idx,
+                                     int *needed_key) {
+    if (needed_key) *needed_key = INF_KEY_NONE;
+    if (!inf) return NULL;
+    for (u32 i = 0; i < inf->count; i++) {
+        const Elevator *el = &inf->elevs[i];
+        if (!el->active || el->sector_idx != sector_idx) continue;
+        if (el->type != ELEV_TYPE_MORPH_SPIN && el->type != ELEV_TYPE_MORPH_MOVE &&
+            el->type != ELEV_TYPE_DOOR && el->type != ELEV_TYPE_INV_DOOR) continue;
+        if (needed_key && el->required_key != INF_KEY_NONE && !el->unlocked)
+            *needed_key = el->required_key;
+        return el->sector_name[0] ? el->sector_name : "door";
+    }
+    return NULL;
+}
+
 bool inf_get_floor(const InfSystem *inf, u32 sector_idx, f32 *floor_y) {
     for (u32 i = 0; i < inf->count; i++) {
         const Elevator *el = &inf->elevs[i];

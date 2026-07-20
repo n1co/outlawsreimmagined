@@ -942,10 +942,18 @@ static void load_entity_anim_seqs(const char *type_name, const Archives *arc,
  * World loading
  * ---------------------------------------------------------------------- */
 
+static void (*g_loading_cb)(float, const char *) = NULL;
+void world_set_loading_cb(void (*cb)(float, const char *)) { g_loading_cb = cb; }
+static void world_progress(float frac, const char *name) {
+    if (g_loading_cb) g_loading_cb(frac, name);
+}
+
 bool world_load(World *world, Archives *arc,
-                Renderer *r, const char *level_name) {
+                Renderer *r, const char *level_name, int difficulty) {
     if (world->loaded) world_free(world);
     memset(world, 0, sizeof(*world));
+    world->difficulty = (difficulty >= 1 && difficulty <= 4) ? difficulty : 2;
+    world_progress(0.0f, level_name);
     entity_list_init(&world->entities);
     inf_init(&world->inf);
     msg_init(&world->messages);
@@ -1115,6 +1123,7 @@ bool world_load(World *world, Archives *arc,
     /* Upload textures using level palette for accurate colour mapping */
     OL_LOG("Uploading textures for %s...\n", level_name);
     g_missing_tex = 0;
+    world_progress(0.25f, level_name);
     upload_level_textures(&world->lvt, arc, r,
                           arc->palette_loaded ? arc->palette : NULL);
     world->missing_textures = g_missing_tex;
@@ -1155,6 +1164,7 @@ bool world_load(World *world, Archives *arc,
     }
 
     /* Build GPU geometry */
+    world_progress(0.55f, level_name);
     OL_LOG("Building GPU geometry...\n");
     if (!renderer_build_level(r, &world->lvt, &world->inf)) {
         OL_ERR("Failed to build level geometry\n");
@@ -1253,8 +1263,21 @@ bool world_load(World *world, Archives *arc,
                 }
             }
 
-            /* Load all entities */
+            /* Load all entities, filtered by difficulty. An object spawns
+             * only if its OBT flags[1] carries the current difficulty's bit
+             * (level_LoadObjects @0x41ccc0): 0x10000000=Easy … 0x80000000=
+             * Hardest. This is why lower difficulties have far fewer enemies
+             * (and items) — without it EVERY object spawns at once. */
+            int diff = (world->difficulty >= 1 && world->difficulty <= 4)
+                       ? world->difficulty : 2;
+            u32 diff_bit = WORLD_DIFF_BIT(diff);
+            u32 skipped_diff = 0;
             for (u32 i = 0; i < obt.object_count; i++) {
+                /* flags[1] high nibble = per-difficulty spawn mask. Objects
+                 * with no difficulty bits at all (mask 0) are level scaffolding
+                 * kept regardless; otherwise require the current bit. */
+                u32 dmask = obt.objects[i].flags[1] & 0xF0000000u;
+                if (dmask != 0 && !(dmask & diff_bit)) { skipped_diff++; continue; }
                 int idx = entity_add(&world->entities, &obt.objects[i]);
                 if (idx < 0) continue;
 
@@ -1314,7 +1337,9 @@ bool world_load(World *world, Archives *arc,
                 }
             }
 
-            OL_LOG("Loaded %u entities\n", world->entities.count);
+            world_progress(0.85f, level_name);
+            OL_LOG("Loaded %u entities (difficulty %d; %u objects skipped by difficulty)\n",
+                   world->entities.count, diff, skipped_diff);
             obt_free(&obt);
         }
     }
@@ -1338,6 +1363,7 @@ bool world_load(World *world, Archives *arc,
         world->player_start = (Vec3){ ax, s->floor_y + 1.0f, az };
     }
 
+    world_progress(1.0f, level_name);
     world->loaded = true;
     OL_LOG("Level '%s' loaded (%u sectors, %u entities)\n",
            level_name, world->lvt.sector_count, world->entities.count);

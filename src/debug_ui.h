@@ -55,7 +55,39 @@ typedef struct {
     int   enemies_total;       /* enemies at load */
     int   enemies_alive;       /* enemies still active */
     int   items_alive;         /* pickups still in the level */
+    int   difficulty;          /* 1..4 */
+
+    /* Player movement detail (read-only) */
+    float player_vx, player_vy, player_vz;
+    int   on_ground;
+    int   crouching;
+    float eye_height;
+    float sector_floor;        /* current sector floor/ceil at player */
+    float sector_ceil;
+
+    /* Weapon (read-only) */
+    int   weapon_idx;
+    int   weapon_clip, weapon_reserve;
+
+    /* "Looking at" — filled each frame by the game loop from a view raycast */
+    char  look_desc[192];      /* human description of what the crosshair hits */
+    float look_dist;           /* distance to the hit (world units) */
+    int   look_sector;         /* sector the ray ends in (-1 none) */
+    int   look_is_door;        /* 1 = a door/portal, 0 = solid/entity/none */
+    int   look_enemy;          /* enemy entity index under the crosshair, -1 none */
+
+    /* FPS history ring buffer for the graph */
+    float fps_hist[128];
+    int   fps_hist_count;      /* number of valid samples (grows to 128) */
+    int   fps_hist_head;       /* next write index */
+
+    /* Requests back to the game (one-shot) */
+    int   req_reload_level;    /* debug: reload current level */
+    int   req_set_difficulty;  /* 0 = none, else 1..4 to apply+reload */
 } DebugState;
+
+/* Push one FPS sample into the ring buffer (call each frame). */
+void debug_ui_push_fps(float fps);
 
 /* Global debug state */
 extern DebugState g_debug;

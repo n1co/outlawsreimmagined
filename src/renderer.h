@@ -241,6 +241,12 @@ void renderer_end_frame(Renderer *r);
 u32 renderer_upload_texture(Renderer *r, const char *name,
                             const u8 *rgba, u32 w, u32 h);
 
+/* Create or update a dynamic RGBA video texture (cutscene frames). *slot is
+ * the texture id: pass 0 on the first call (a new LINEAR, non-mipmapped slot
+ * is created and stored back into *slot); reuse it to stream later frames via
+ * glTexSubImage2D. */
+void renderer_upload_video(Renderer *r, u32 *slot, const u8 *rgba, int w, int h);
+
 /* Find a texture by name (lowercase). Returns 0 if not found. */
 u32 renderer_find_texture(const Renderer *r, const char *name);
 
@@ -298,6 +304,11 @@ void renderer_draw_sprites(Renderer *r, const EntityList *entities);
 
 /* Draw the HUD overlay (2D orthographic, disables depth test). */
 void renderer_draw_hud(Renderer *r, const HudParams *hud);
+
+/* Draw the level loading screen (MM220 background + green progress bar +
+ * level name). progress in [0,1]. Caller swaps buffers. */
+void renderer_draw_loading(Renderer *r, u32 bg_tex, float progress,
+                           const char *label);
 
 /* Automap overlay (TAB): player-oriented top-down wall map over the 3D view. */
 void renderer_draw_minimap(Renderer *r, const LvtLevel *level,

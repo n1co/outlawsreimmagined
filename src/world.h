@@ -69,7 +69,22 @@ typedef struct {
 
     /* Current music track */
     char        music_file[128];
+
+    /* Difficulty level 1..4 (Easy/Medium/Hard/Hardest). Objects carry per-
+     * difficulty spawn bits in OBT flags[1] high nibble (0x10000000<<（d-1)):
+     * level_LoadObjects @0x41ccc0 spawns an object only if that bit is set.
+     * Set before world_load(); default 2 (Medium). */
+    int         difficulty;
 } World;
+
+/* OBT flags[1] difficulty bit for difficulty level d (1..4). */
+#define WORLD_DIFF_BIT(d)  (0x10000000u << ((d) - 1))
+
+/* Loading-progress callback: world_load calls it at each stage with a
+ * fraction 0..1 and the level name, so the game loop can draw+swap the
+ * loading screen (faithful to the original's interleaved progress bar).
+ * Set to NULL to disable (headless). */
+void world_set_loading_cb(void (*cb)(float frac, const char *name));
 
 /* Open all LAB archives. Returns true if essential archives opened. */
 bool archives_open(Archives *arc, const char *data_dir);
@@ -88,9 +103,10 @@ void archives_close(Archives *arc);
  * Load a level by name. Uploads textures and builds GPU meshes.
  * Loads entities from OBT and attempts to load their WAX sprites.
  */
-/* Non-const arc because level loading may update the palette. */
+/* Non-const arc because level loading may update the palette.
+ * difficulty (1..4) selects which OBT objects spawn (per-difficulty bits). */
 bool world_load(World *world, Archives *arc,
-                Renderer *r, const char *level_name);
+                Renderer *r, const char *level_name, int difficulty);
 
 /* Free world resources. */
 void world_free(World *world);

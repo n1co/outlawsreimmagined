@@ -390,6 +390,32 @@ u32 renderer_upload_texture(Renderer *r, const char *name,
     return idx + 1; /* 1-based index, 0 = "no texture" */
 }
 
+void renderer_upload_video(Renderer *r, u32 *slot, const u8 *rgba, int w, int h) {
+    if (!slot || !rgba) return;
+    if (*slot == 0) {
+        if (r->texture_count >= R_MAX_TEXTURES) return;
+        GLuint handle;
+        glGenTextures(1, &handle);
+        glBindTexture(GL_TEXTURE_2D, handle);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        u32 idx = r->texture_count++;
+        r->textures[idx].handle = handle;
+        r->textures[idx].width  = (u32)w;
+        r->textures[idx].height = (u32)h;
+        snprintf(r->textures[idx].name, sizeof(r->textures[idx].name), "$video%u", idx);
+        *slot = idx + 1;
+    } else if (*slot <= r->texture_count) {
+        glBindTexture(GL_TEXTURE_2D, r->textures[*slot - 1].handle);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+}
+
 u32 renderer_find_texture(const Renderer *r, const char *name) {
     char lower[64]; snprintf(lower, sizeof(lower), "%s", name);
     for (char *p = lower; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 32;
@@ -2375,6 +2401,93 @@ void renderer_draw_hud(Renderer *r, const HudParams *hud) {
     glBindVertexArray(0);
     glUseProgram(0);
     glDisable(GL_BLEND);
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_CULL_FACE);
+}
+
+/* -------------------------------------------------------------------------
+ * Level loading screen (faithful to olwin.exe FUN_0042d050):
+ *   background = MM220.PCX (640x480), a thin GREEN progress bar at
+ *   x=80 y=420 w=320 h=5 (in the 640x480 background space; RGB≈1,254,96),
+ *   plus the level name. Rendered by the game loop between load stages.
+ * ---------------------------------------------------------------------- */
+void renderer_draw_loading(Renderer *r, u32 bg_tex, f32 progress,
+                           const char *label) {
+    if (!r->prog_hud || !r->hud_vao) return;
+    if (progress < 0.0f) progress = 0.0f;
+    if (progress > 1.0f) progress = 1.0f;
+
+    f32 W = (f32)r->cfg.width, H = (f32)r->cfg.height;
+    f32 sx = W / 640.0f, sy = H / 480.0f;
+    Mat4 ortho = mat4_ortho(0, W, H, 0, -1, 1);
+
+    glUseProgram(r->prog_hud);
+    GLint ortho_loc  = glGetUniformLocation(r->prog_hud, "uOrtho");
+    GLint hastex_loc = glGetUniformLocation(r->prog_hud, "uHasTex");
+    GLint tex_loc    = glGetUniformLocation(r->prog_hud, "uTex");
+    glUniformMatrix4fv(ortho_loc, 1, GL_FALSE, &ortho.m[0][0]);
+    glUniform1i(tex_loc, 0);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
+    glBindVertexArray(r->hud_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, r->hud_vbo);
+
+    static f32 vb[1024 * 6 * HUD_STRIDE];
+    u32 nv;
+    #define LD_FLUSH(tex,has) do { if (nv){ \
+        glUniform1i(hastex_loc,(has)?1:0); glActiveTexture(GL_TEXTURE0); \
+        if((has)&&(tex)>0&&(tex)<=r->texture_count) glBindTexture(GL_TEXTURE_2D,r->textures[(tex)-1].handle); \
+        else glBindTexture(GL_TEXTURE_2D,0); \
+        glBufferSubData(GL_ARRAY_BUFFER,0,nv*HUD_STRIDE*sizeof(f32),vb); \
+        glDrawArrays(GL_TRIANGLES,0,(GLsizei)nv); nv=0; } } while(0)
+
+    /* Opaque black backdrop (so any index-0/discarded bg texels stay black,
+     * not the sky clear-color), then the MM220 background on top. */
+    nv = 0;
+    hud_quad(vb,&nv, 0,0, W,H, 0,0,0,0, 0,0,0,1);
+    LD_FLUSH(0, false);
+    if (bg_tex > 0 && bg_tex <= r->texture_count) {
+        hud_quad(vb,&nv, 0,0, W,H, 0,0,1,1, 1,1,1,1);
+        LD_FLUSH(bg_tex, true);
+    }
+
+    /* Progress bar: dark trough + green fill (RGB 1/254/96). */
+    f32 bx = 80.0f * sx, by = 420.0f * sy, bw = 320.0f * sx, bh = 5.0f * sy;
+    if (bh < 3.0f) bh = 3.0f;
+    hud_quad(vb,&nv, bx-1, by-1, bx+bw+1, by+bh+1, 0,0,0,0, 0,0,0,0.6f);
+    LD_FLUSH(0, false);
+    hud_quad(vb,&nv, bx, by, bx + bw*progress, by+bh, 0,0,0,0,
+             1.0f/255.0f, 254.0f/255.0f, 96.0f/255.0f, 1.0f);
+    LD_FLUSH(0, false);
+
+    /* Level name centred just above the bar. */
+    if (label && label[0]) {
+        int len = 0; while (label[len] && len < 32) len++;
+        f32 px = OL_MAX(2.0f, sy * 3.0f);
+        f32 cw = 6.0f * px;
+        f32 tx = (W - len * cw) * 0.5f, ty = by - 14.0f * px;
+        for (int pass = 0; pass < 2; pass++) {
+            f32 ox = (pass==0)?px:0, oy = (pass==0)?px:0;
+            f32 cr = (pass==0)?0:1, cg = (pass==0)?0:0.92f, cb = (pass==0)?0:0.55f;
+            for (int ci = 0; ci < len; ci++) {
+                int gi = font5x7_index(label[ci]);
+                const unsigned char *gl = FONT5X7[gi];
+                f32 gx = tx + ci*cw + ox;
+                for (int col = 0; col < 5; col++)
+                    for (int row = 0; row < 7; row++) {
+                        if (!(gl[col] & (1<<row))) continue;
+                        f32 qx = gx+col*px, qy = ty+row*px+oy;
+                        hud_quad(vb,&nv, qx,qy, qx+px,qy+px, 0,0,0,0, cr,cg,cb,1);
+                    }
+            }
+            LD_FLUSH(0, false);
+        }
+    }
+    #undef LD_FLUSH
+
+    glBindVertexArray(0);
+    glUseProgram(0);
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_CULL_FACE);
 }

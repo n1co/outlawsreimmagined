@@ -12,6 +12,7 @@
 #include "input.h"
 #include "player.h"
 #include "world.h"
+#include "pcx.h"
 #include "collision.h"
 #include "entity.h"
 #include "weapon.h"
@@ -23,9 +24,12 @@
 #include "savegame.h"
 #include "projectile.h"
 #include "tdo.h"
+#include "smush.h"
 
 #include <SDL2/SDL.h>
 #include <math.h>
+#include <ctype.h>
+#include <stdio.h>
 
 /* -------------------------------------------------------------------------
  * Configuration
@@ -81,9 +85,12 @@ typedef struct {
     bool  in_menu;               /* true while the front-end menu is showing */
     bool  level_from_cli;        /* --level given → skip menu */
     bool  force_menu;            /* --menu → always start at the menu */
+    char  cutscene_cli[64];      /* --cutscene <name>: play one .SAN and exit */
 
     /* Story campaign progression + in-game pause. */
     char  campaign[16][64];      /* level order parsed from OUTLAWS.RCS */
+    char  campaign_movie[16][32];/* MOVIE/CREDITS .SAN played AFTER campaign[i] ("" = none) */
+    char  campaign_open_movie[32];/* opening cinematic (op_cr.san) at story start */
     int   campaign_count;
     bool  campaign_active;       /* STORY: auto-advance through the level order */
     int   campaign_idx;          /* current index into campaign[] */
@@ -136,6 +143,9 @@ typedef struct {
     u32   sfx_glass_break;           /* Glass window shatter */
     u32   sfx_locked;                /* Locked door (no key) */
     u32   sfx_unlock;                /* Door unlocked with key */
+
+    int   difficulty;                /* 1..4 (Easy/Medium/Hard/Hardest); default 2 */
+    u32   loading_bg_tex;            /* MM220.PCX loading-screen background */
 } App;
 
 static App g_app;
@@ -825,12 +835,26 @@ static void relocate_player_sector(void) {
     g_app.player.sector_idx = s;
 }
 
+/* Loading-screen callback: world_load calls this at each stage; draw the
+ * MM220 background + green progress bar + level name, then swap. */
+static void loading_progress_cb(float frac, const char *name) {
+    if (g_app.screenshot_frames > 0) return;   /* headless: no interleave */
+    char up[32]; int i = 0;
+    for (; name && name[i] && i < 31; i++)
+        up[i] = (name[i] >= 'a' && name[i] <= 'z') ? name[i] - 32 : name[i];
+    up[i] = '\0';
+    renderer_begin_frame(&g_app.renderer);
+    renderer_draw_loading(&g_app.renderer, g_app.loading_bg_tex, frac, up);
+    renderer_end_frame(&g_app.renderer);
+}
+
 static bool load_level_runtime(const char *name) {
     if (name != g_app.level_name)   /* avoid snprintf self-copy (UB) */
         snprintf(g_app.level_name, sizeof(g_app.level_name), "%s", name);
     audio_stop_all(&g_app.audio);
     if (g_app.world.loaded) world_free(&g_app.world);
-    if (!world_load(&g_app.world, &g_app.archives, &g_app.renderer, g_app.level_name)) {
+    if (!world_load(&g_app.world, &g_app.archives, &g_app.renderer,
+                    g_app.level_name, g_app.difficulty)) {
         OL_ERR("Failed to load level '%s'\n", g_app.level_name);
         return false;
     }
@@ -1033,6 +1057,11 @@ static const char *CAMPAIGN_FALLBACK[] = {
     "hideout", "town", "train", "canyon", "mill",
     "simms", "miner", "cliff", "ranch",
 };
+/* Cutscene played AFTER each fallback level (from OUTLAWS.RCS MOVIE/CREDITS). */
+static const char *CAMPAIGN_FALLBACK_MOVIE[] = {
+    "she_tob.san", "toe_trb.san", "tre_cab.san", "cae_sab.san", "sae_hib.san",
+    "hie_mnb.san", "mne_clb.san", "cle_rab.san", "rae.san",
+};
 
 /*
  * Build the campaign level order by parsing the original story script
@@ -1040,36 +1069,237 @@ static const char *CAMPAIGN_FALLBACK[] = {
  * This is exactly how the original sequences the story. Falls back to the
  * verified retail order if the script is missing.
  */
+/* Read an entire file into a malloc'd buffer (caller frees). NULL on error. */
+static u8 *read_whole_file(const char *path, u32 *out_sz) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (n <= 0) { fclose(f); return NULL; }
+    u8 *b = (u8 *)malloc((size_t)n);
+    if (!b) { fclose(f); return NULL; }
+    size_t rd = fread(b, 1, (size_t)n, f);
+    fclose(f);
+    if (rd != (size_t)n) { free(b); return NULL; }
+    *out_sz = (u32)n;
+    return b;
+}
+
+/*
+ * Play a SMUSH .SAN cutscene fullscreen (letterboxed to the video's 4:3),
+ * synced to its IACT audio track. Esc / Enter / Space / mouse-click / window
+ * close skips it (faithful: the original skips on Esc). The .SAN files are
+ * loose files in the data directory. Returns false if the user asked to quit
+ * the whole application (SDL_QUIT), true otherwise.
+ */
+static bool cutscene_play(const char *san_name) {
+    if (!san_name || !san_name[0]) return true;
+    if (g_app.screenshot_frames > 0 || g_app.check_mode ||
+        g_app.check_doors_mode) return true;   /* headless/automated */
+
+    char path[1024], up[64];
+    u32 fsz = 0;
+    snprintf(path, sizeof path, "%s/%s", g_app.data_dir, san_name);
+    u8 *fdata = read_whole_file(path, &fsz);
+    if (!fdata) {   /* retry uppercase (data files are UPPERCASE on disk) */
+        int i = 0;
+        for (; san_name[i] && i < 63; i++) up[i] = (char)toupper((unsigned char)san_name[i]);
+        up[i] = '\0';
+        snprintf(path, sizeof path, "%s/%s", g_app.data_dir, up);
+        fdata = read_whole_file(path, &fsz);
+    }
+    if (!fdata) { OL_WARN("Cutscene '%s' not found\n", san_name); return true; }
+
+    SmushVideo *v = smush_open(fdata, fsz);
+    if (!v) { OL_WARN("Cutscene '%s' failed to parse\n", san_name); free(fdata); return true; }
+    int vw = smush_width(v), vh = smush_height(v);
+    float fps = smush_fps(v);
+    OL_LOG("Cutscene %s: %dx%d, %d frames @ %.0f fps\n",
+           san_name, vw, vh, smush_frame_count(v), fps);
+
+    /* Dedicated 22050 Hz S16 stereo device for the IACT audio stream. */
+    SDL_AudioSpec want, have;
+    SDL_zero(want);
+    want.freq = 22050; want.format = AUDIO_S16SYS; want.channels = 2; want.samples = 2048;
+    SDL_AudioDeviceID dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+    if (dev) SDL_PauseAudioDevice(dev, 0);
+
+    SDL_bool prev_rel = SDL_GetRelativeMouseMode();
+    if (prev_rel) SDL_SetRelativeMouseMode(SDL_FALSE);
+
+    u32 vtex = 0;
+    long queued_bytes = 0;
+    Uint32 start = SDL_GetTicks();
+    bool skip = false, quit = false;
+    const u8 *rgba; const i16 *pcm; int pb; int fi = 0;
+
+    while (smush_next(v, &rgba, &pcm, &pb)) {
+        if (rgba) renderer_upload_video(&g_app.renderer, &vtex, rgba, vw, vh);
+        if (dev && pcm && pb > 0) { SDL_QueueAudio(dev, pcm, (Uint32)pb); queued_bytes += pb; }
+
+        f32 W = (f32)g_app.renderer.cfg.width, H = (f32)g_app.renderer.cfg.height;
+        f32 sc = (W / (f32)vw < H / (f32)vh) ? W / (f32)vw : H / (f32)vh;
+        f32 dw = vw * sc, dh = vh * sc, dx = (W - dw) * 0.5f, dy = (H - dh) * 0.5f;
+        renderer_begin_frame(&g_app.renderer);
+        renderer_draw_rect(&g_app.renderer, 0, 0, W, H, 0, 0, 0, 1);   /* letterbox bars */
+        if (vtex) renderer_draw_image(&g_app.renderer, vtex, dx, dy, dw, dh, 1.0f, 1.0f);
+        renderer_end_frame(&g_app.renderer);
+
+        /* Present the next frame when playback (audio clock, else wall clock)
+         * reaches its timestamp — keeps video synced to the audio. */
+        double target = (double)(fi + 1) / (double)fps;
+        for (;;) {
+            SDL_Event e;
+            while (SDL_PollEvent(&e)) {
+                if (e.type == SDL_QUIT) { quit = true; skip = true; }
+                else if (e.type == SDL_KEYDOWN) {
+                    SDL_Keycode k = e.key.keysym.sym;
+                    if (k == SDLK_ESCAPE || k == SDLK_RETURN || k == SDLK_KP_ENTER ||
+                        k == SDLK_SPACE) skip = true;
+                } else if (e.type == SDL_MOUSEBUTTONDOWN) {
+                    skip = true;
+                } else if (e.type == SDL_WINDOWEVENT &&
+                           e.window.event == SDL_WINDOWEVENT_RESIZED) {
+                    renderer_resize(&g_app.renderer, e.window.data1, e.window.data2);
+                }
+            }
+            if (skip) break;
+            double now;
+            if (dev && queued_bytes > 0) {
+                Uint32 rem = SDL_GetQueuedAudioSize(dev);
+                now = (double)(queued_bytes - (long)rem) / (4.0 * 22050.0);
+            } else {
+                now = (SDL_GetTicks() - start) / 1000.0;
+            }
+            if (now >= target) break;
+            SDL_Delay(2);
+        }
+        if (skip) break;
+        fi++;
+    }
+
+    if (dev) { SDL_PauseAudioDevice(dev, 1); SDL_ClearQueuedAudio(dev); SDL_CloseAudioDevice(dev); }
+    if (prev_rel) SDL_SetRelativeMouseMode(SDL_TRUE);
+    smush_close(v);
+    free(fdata);
+    return !quit;
+}
+
+/* Headless: decode a representative frame of a cutscene, render it through the
+ * engine (video texture + letterboxed quad) and save a BMP. Verifies the whole
+ * in-engine playback path without a display. */
+static void cutscene_shot(const char *san_name, const char *out_bmp) {
+    char path[1024], up[64]; u32 fsz = 0;
+    snprintf(path, sizeof path, "%s/%s", g_app.data_dir, san_name);
+    u8 *fdata = read_whole_file(path, &fsz);
+    if (!fdata) {
+        int i = 0; for (; san_name[i] && i < 63; i++) up[i]=(char)toupper((unsigned char)san_name[i]);
+        up[i]='\0'; snprintf(path, sizeof path, "%s/%s", g_app.data_dir, up);
+        fdata = read_whole_file(path, &fsz);
+    }
+    if (!fdata) { printf("CUTSCENE %s RESULT=FAIL (not found)\n", san_name); return; }
+    SmushVideo *v = smush_open(fdata, fsz);
+    if (!v) { printf("CUTSCENE %s RESULT=FAIL (parse)\n", san_name); free(fdata); return; }
+    int vw = smush_width(v), vh = smush_height(v);
+    int target = smush_frame_count(v) / 8; if (target < 30) target = 30;
+    u32 vtex = 0; const u8 *rgba; const i16 *pcm; int pb, fi = 0; long apcm = 0;
+    while (smush_next(v, &rgba, &pcm, &pb)) {
+        apcm += pb;
+        if (rgba) renderer_upload_video(&g_app.renderer, &vtex, rgba, vw, vh);
+        if (fi >= target) break;
+        fi++;
+    }
+    f32 W = (f32)g_app.renderer.cfg.width, H = (f32)g_app.renderer.cfg.height;
+    f32 sc = (W/(f32)vw < H/(f32)vh) ? W/(f32)vw : H/(f32)vh;
+    f32 dw = vw*sc, dh = vh*sc, dx = (W-dw)*0.5f, dy = (H-dh)*0.5f;
+    renderer_begin_frame(&g_app.renderer);
+    renderer_draw_rect(&g_app.renderer, 0, 0, W, H, 0, 0, 0, 1);
+    if (vtex) renderer_draw_image(&g_app.renderer, vtex, dx, dy, dw, dh, 1.0f, 1.0f);
+    glFinish();
+    int w = g_app.renderer.cfg.width, h = g_app.renderer.cfg.height;
+    u8 *px = (u8*)malloc((size_t)w*h*4);
+    glReadPixels(0,0,w,h,GL_RGBA,GL_UNSIGNED_BYTE,px);
+    u8 *fl = (u8*)malloc((size_t)w*h*4);
+    for (int y=0;y<h;y++) memcpy(fl+(size_t)(h-1-y)*w*4, px+(size_t)y*w*4, (size_t)w*4);
+    SDL_Surface *sf = SDL_CreateRGBSurfaceFrom(fl,w,h,32,w*4,0xFF,0xFF00,0xFF0000,0xFF000000);
+    if (sf){ SDL_SaveBMP(sf, out_bmp); SDL_FreeSurface(sf); }
+    free(fl); free(px);
+    printf("CUTSCENE %s RESULT=OK %dx%d frames=%d audio=%.1fs -> %s\n",
+           san_name, vw, vh, smush_frame_count(v), apcm/4.0/22050.0, out_bmp);
+    smush_close(v); free(fdata);
+}
+
+/* Read the whitespace-delimited token at *pp into buf (advances *pp). */
+static void rcs_token(const char **pp, const char *end, char *buf, int cap) {
+    const char *p = *pp;
+    while (p < end && (*p == ' ' || *p == '\t')) p++;
+    int n = 0;
+    while (p < end && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n' && n < cap - 1)
+        buf[n++] = *p++;
+    buf[n] = '\0';
+    *pp = p;
+}
+
 static void campaign_parse(void) {
     g_app.campaign_count = 0;
+    g_app.campaign_open_movie[0] = '\0';
+    for (int i = 0; i < 16; i++) g_app.campaign_movie[i][0] = '\0';
+
     u32 sz = 0;
     const u8 *d = archives_get(&g_app.archives, "OUTLAWS.RCS", &sz);
     if (d && sz > 0) {
         const char *p = (const char *)d, *end = p + sz;
-        while (p < end && g_app.campaign_count < 16) {
-            /* find "LEVEL:" */
+        int last_level = -1;
+        bool ended = false;
+        /* Parse only the first campaign block (LEVEL/MOVIE/CREDITS ... END).
+         * MOVIE:/CREDITS: name the .SAN played after the most recent LEVEL. */
+        while (p < end && g_app.campaign_count < 16 && !ended) {
             if ((size_t)(end - p) >= 6 && strncasecmp(p, "LEVEL:", 6) == 0) {
                 p += 6;
-                while (p < end && (*p == ' ' || *p == '\t')) p++;
-                char *dst = g_app.campaign[g_app.campaign_count];
-                int n = 0;
-                while (p < end && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n' && n < 63)
-                    dst[n++] = *p++;
-                dst[n] = '\0';
-                if (n > 0) g_app.campaign_count++;
+                rcs_token(&p, end, g_app.campaign[g_app.campaign_count],
+                          (int)sizeof(g_app.campaign[0]));
+                if (g_app.campaign[g_app.campaign_count][0]) {
+                    last_level = g_app.campaign_count;
+                    g_app.campaign_count++;
+                }
+            } else if (((size_t)(end - p) >= 6 && strncasecmp(p, "MOVIE:", 6) == 0) ||
+                       ((size_t)(end - p) >= 8 && strncasecmp(p, "CREDITS:", 8) == 0)) {
+                int kw = (strncasecmp(p, "MOVIE:", 6) == 0) ? 6 : 8;
+                p += kw;
+                char tok[32];
+                rcs_token(&p, end, tok, sizeof(tok));
+                if (tok[0] && last_level >= 0)
+                    snprintf(g_app.campaign_movie[last_level], 32, "%s", tok);
+            } else if ((size_t)(end - p) >= 3 && strncasecmp(p, "END", 3) == 0 &&
+                       (p + 3 >= end || p[3] == '\r' || p[3] == '\n' ||
+                        p[3] == ' ' || p[3] == '\t')) {
+                if (g_app.campaign_count > 0) ended = true; else p++;
             } else {
                 p++;
+            }
+        }
+        /* Opening cinematic: the ITEM "outlaws" OPEN1 entry names op_cr.san. */
+        for (const char *q = (const char *)d; q + 5 < end; q++) {
+            if (strncasecmp(q, "op_cr", 5) == 0) {
+                rcs_token(&q, end, g_app.campaign_open_movie,
+                          (int)sizeof(g_app.campaign_open_movie));
+                break;
             }
         }
     }
     if (g_app.campaign_count == 0) {
         int n = (int)(sizeof(CAMPAIGN_FALLBACK)/sizeof(CAMPAIGN_FALLBACK[0]));
-        for (int i = 0; i < n; i++)
+        for (int i = 0; i < n; i++) {
             snprintf(g_app.campaign[i], sizeof(g_app.campaign[i]), "%s", CAMPAIGN_FALLBACK[i]);
+            snprintf(g_app.campaign_movie[i], 32, "%s", CAMPAIGN_FALLBACK_MOVIE[i]);
+        }
         g_app.campaign_count = n;
     }
-    OL_LOG("Campaign: %d missions (%s ...)\n", g_app.campaign_count,
-           g_app.campaign_count ? g_app.campaign[0] : "?");
+    if (g_app.campaign_open_movie[0] == '\0')
+        snprintf(g_app.campaign_open_movie, sizeof(g_app.campaign_open_movie), "op_cr.san");
+    OL_LOG("Campaign: %d missions (%s ...), opening=%s\n", g_app.campaign_count,
+           g_app.campaign_count ? g_app.campaign[0] : "?", g_app.campaign_open_movie);
 }
 
 /* Load campaign level `idx`. If carry, keep only the weapons + ammo (health
@@ -1136,6 +1366,7 @@ static bool do_load(int slot) {
 static bool app_init(int argc, char **argv) {
     snprintf(g_app.data_dir,   sizeof(g_app.data_dir),   "%s", DEFAULT_DATA);
     snprintf(g_app.level_name, sizeof(g_app.level_name), "%s", DEFAULT_LEVEL);
+    g_app.difficulty = 2;   /* Medium — Outlaws campaign default */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--data") == 0 && i+1 < argc) {
@@ -1155,6 +1386,8 @@ static bool app_init(int argc, char **argv) {
             g_app.screenshot_frames = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--fire") == 0) {
             g_app.screenshot_firing = true;
+        } else if (strcmp(argv[i], "--difficulty") == 0 && i+1 < argc) {
+            g_app.difficulty = atoi(argv[++i]);   /* 1..4 */
         } else if (strcmp(argv[i], "--weapon") == 0 && i+1 < argc) {
             g_app.screenshot_weapon = atoi(argv[++i]);
             g_app.screenshot_weapon_set = true;
@@ -1174,6 +1407,8 @@ static bool app_init(int argc, char **argv) {
             g_app.show_map = true;        /* debug: automap on at start */
         } else if (strcmp(argv[i], "--menu") == 0) {
             g_app.force_menu = true;      /* start at the front-end menu */
+        } else if (strcmp(argv[i], "--cutscene") == 0 && i+1 < argc) {
+            snprintf(g_app.cutscene_cli, sizeof(g_app.cutscene_cli), "%s", argv[++i]);
         } else if (strcmp(argv[i], "--posy") == 0 && i+1 < argc) {
             g_app.spawn_y = (f32)atof(argv[++i]);
             g_app.spawn_y_set = true;     /* explicit spawn height (test upper floors) */
@@ -1239,6 +1474,24 @@ static bool app_init(int argc, char **argv) {
     /* Load HUD assets (weapon sprites, face portrait) BEFORE the level so the
      * HUD/weapon textures are guaranteed a slot even on large levels. */
     load_hud_assets(&g_app.renderer, &g_app.archives);
+
+    /* Loading-screen background MM220.PCX (OLPAL palette) + progress callback. */
+    {
+        u32 sz = 0;
+        const u8 *d = archives_get(&g_app.archives, "MM220.PCX", &sz);
+        if (d && sz) {
+            u32 w = 0, h = 0;
+            /* MM220.PCX is a standalone image with its OWN embedded palette —
+             * decode with that, not the level/OLPAL palette. */
+            u8 *rgba = pcx_decode_rgba(d, sz, &w, &h);
+            if (rgba) {
+                g_app.loading_bg_tex =
+                    renderer_upload_texture(&g_app.renderer, "mm220_loadscreen", rgba, w, h);
+                free(rgba);
+            }
+        }
+        world_set_loading_cb(loading_progress_cb);
+    }
 
     /* Global (level-independent) sound effects. */
     load_sfx();
@@ -1691,6 +1944,97 @@ static void handle_thrown_weapon(bool lmb_press, bool lmb_held,
     }
 }
 
+/* Fill g_debug.look_* : describe what the crosshair points at (for the debug
+ * "Looking At" panel). Walks the view ray through the sector graph to the
+ * first solid wall (or a portal/door), and checks for an enemy under it. */
+static void debug_compute_lookat(void) {
+    const LvtLevel *lvt = &g_app.world.lvt;
+    Vec3 eye = player_eye_pos(&g_app.player);
+    f32 cp = cosf(g_app.player.pitch), sp = sinf(g_app.player.pitch);
+    f32 cy = cosf(g_app.player.yaw),   sy = sinf(g_app.player.yaw);
+    Vec3 dir = { cy*cp, sp, sy*cp };
+
+    g_debug.look_desc[0] = '\0';
+    g_debug.look_dist = 0; g_debug.look_sector = -1;
+    g_debug.look_is_door = 0; g_debug.look_enemy = -1;
+
+    /* Enemy under the crosshair? */
+    f32 edist;
+    int ei = entity_raycast(&g_app.world.entities, lvt, eye, dir, 512.0f, &edist);
+
+    /* Walk the ray to the first wall hit. */
+    int cur = g_app.player.sector_idx;
+    if (cur < 0 || cur >= (i32)lvt->sector_count) cur = collision_find_sector(lvt, eye.x, eye.z, 0);
+    f32 cx = eye.x, cz = eye.z, travelled = 0.0f;
+    f32 rlen = sqrtf(dir.x*dir.x + dir.z*dir.z);
+    char walldesc[160]; walldesc[0] = '\0';
+    f32 walldist = 1e9f; int wallsec = -1; int wallisdoor = 0;
+    if (rlen > 1e-4f) {
+        for (int step = 0; step < 64 && travelled < 512.0f; step++) {
+            if (cur < 0 || cur >= (i32)lvt->sector_count) break;
+            const LvtSector *sec = &lvt->sectors[cur];
+            f32 best_t = 1e30f; i32 best_wi = -1;
+            for (u32 wi = 0; wi < sec->wall_count; wi++) {
+                const LvtWall *w = &sec->walls[wi];
+                if (w->v1 < 0 || w->v2 < 0) continue;
+                f32 ax = sec->vertices[w->v1].x, az = sec->vertices[w->v1].y;
+                f32 bx = sec->vertices[w->v2].x, bz = sec->vertices[w->v2].y;
+                f32 edx = bx - ax, edz = bz - az;
+                f32 den = dir.x * edz - dir.z * edx;
+                if (fabsf(den) < 1e-8f) continue;
+                f32 t = ((ax - cx) * edz - (az - cz) * edx) / den;
+                f32 u = ((ax - cx) * dir.z - (az - cz) * dir.x) / den;
+                if (t < 1e-4f || u < -0.001f || u > 1.001f) continue;
+                if (t < best_t) { best_t = t; best_wi = (i32)wi; }
+            }
+            if (best_wi < 0) break;
+            const LvtWall *bw = &sec->walls[best_wi];
+            travelled = best_t * rlen;
+            walldist = travelled; wallsec = cur;
+            if (bw->adjoin < 0 || bw->adjoin >= (i32)lvt->sector_count) {
+                snprintf(walldesc, sizeof(walldesc), "Solid wall (sector %d)", cur);
+                break;
+            }
+            /* Is this wall a door (an INF morph/door on the adjoin sector)? */
+            int nk = INF_KEY_NONE;
+            const char *dn = inf_door_name_for_sector(&g_app.world.inf, (u32)bw->adjoin, &nk);
+            if (dn) {
+                wallisdoor = 1;
+                if (nk != INF_KEY_NONE)
+                    snprintf(walldesc, sizeof(walldesc), "Door: %s (needs %s)",
+                             dn, inf_key_name(nk));
+                else
+                    snprintf(walldesc, sizeof(walldesc), "Door: %s", dn);
+                break;
+            }
+            if (bw->is_window && !bw->window_broken) {
+                snprintf(walldesc, sizeof(walldesc), "Glass window (sector %d)", cur);
+                break;
+            }
+            /* Open portal — continue into the adjoin. */
+            wallisdoor = 1;
+            snprintf(walldesc, sizeof(walldesc), "Portal -> sector %d", bw->adjoin);
+            cx = eye.x + dir.x * best_t; cz = eye.z + dir.z * best_t;
+            cur = bw->adjoin;
+        }
+    }
+
+    /* Prefer the closer of enemy vs wall. */
+    if (ei >= 0 && edist < walldist) {
+        const Entity *e = &g_app.world.entities.entities[ei];
+        snprintf(g_debug.look_desc, sizeof(g_debug.look_desc),
+                 "Enemy: %s  (hp %d)", e->type_name, e->health);
+        g_debug.look_enemy = ei;
+        g_debug.look_dist = edist;
+        g_debug.look_sector = cur;
+    } else if (wallsec >= 0) {
+        snprintf(g_debug.look_desc, sizeof(g_debug.look_desc), "%s", walldesc);
+        g_debug.look_dist = walldist;
+        g_debug.look_sector = wallsec;
+        g_debug.look_is_door = wallisdoor;
+    }
+}
+
 /* -------------------------------------------------------------------------
  * Game loop
  * ---------------------------------------------------------------------- */
@@ -1729,11 +2073,15 @@ static void app_run(void) {
             /* STORY → begin the campaign at mission 1. */
             if (g_app.menu.start_story) {
                 g_app.menu.start_story = false;
+                /* Opening cinematic (op_cr.san) before mission 1, Esc to skip. */
+                if (!cutscene_play(g_app.campaign_open_movie)) { g_app.running = false; break; }
                 if (campaign_load(0, false)) {
                     g_app.in_menu = false;
                     g_app.menu.screen = MENU_INGAME;
                     input_capture_mouse(&g_app.input, true);
                 }
+                last_ticks = SDL_GetTicks64();
+                continue;
             }
             /* MULTIPLAYER / debug poster select → load a single map (no campaign). */
             if (g_app.menu.start_level[0]) {
@@ -1773,8 +2121,14 @@ static void app_run(void) {
             if (g_app.level_done_timer <= 0.0f) {
                 g_app.level_done = false;
                 int next = g_app.campaign_idx + 1;
+                /* Transition cinematic for the level just completed (the last
+                 * level's movie is the end-credits reel). Esc skips. */
+                const char *mv = g_app.campaign_movie[g_app.campaign_idx];
+                if (mv[0] && !cutscene_play(mv)) { g_app.running = false; break; }
                 if (next < g_app.campaign_count) {
                     campaign_load(next, true);   /* carry the loadout forward */
+                    last_ticks = SDL_GetTicks64();
+                    continue;
                 } else {
                     /* Campaign finished → return to the front-end menu. */
                     g_app.campaign_active = false;
@@ -2505,6 +2859,25 @@ render_frame:
             g_debug.draw_calls = (int)g_app.renderer.level_mesh_count;
             g_debug.dt = dt;
             g_debug.fps = (dt > 0.0f) ? 1.0f / dt : 0.0f;
+            debug_ui_push_fps(g_debug.fps);
+            /* Movement / sector detail */
+            g_debug.player_vx = g_app.player.vel.x;
+            g_debug.player_vy = g_app.player.vel_y;
+            g_debug.player_vz = g_app.player.vel.z;
+            g_debug.on_ground = g_app.player.on_ground ? 1 : 0;
+            g_debug.crouching = g_app.player.crouching ? 1 : 0;
+            g_debug.eye_height = g_app.player.eye_height;
+            g_debug.difficulty = g_app.difficulty;
+            g_debug.weapon_idx = (int)g_app.player.weapons.current;
+            g_debug.weapon_clip = g_app.player.weapons.clip[g_app.player.weapons.current];
+            g_debug.weapon_reserve = g_app.player.weapons.ammo[g_app.player.weapons.current];
+            {
+                f32 fy = 0, cy2 = 256;
+                collision_heights(&g_app.world.lvt, g_app.player.sector_idx,
+                                  g_app.player.pos.x, g_app.player.pos.z, &fy, &cy2);
+                g_debug.sector_floor = fy; g_debug.sector_ceil = cy2;
+            }
+            debug_compute_lookat();
 
             /* Level / mission status */
             snprintf(g_debug.map_name, sizeof(g_debug.map_name), "%s", g_app.level_name);
@@ -2549,6 +2922,17 @@ render_frame:
             if (g_debug.give_items) {
                 g_app.player.keys |= g_debug.give_items;
                 g_debug.give_items = 0;
+            }
+            /* Debug: set difficulty (reloads the level) / reload level. */
+            if (g_debug.req_set_difficulty >= 1 && g_debug.req_set_difficulty <= 4) {
+                g_app.difficulty = g_debug.req_set_difficulty;
+                g_debug.req_set_difficulty = 0;
+                g_debug.req_reload_level = 1;
+            }
+            if (g_debug.req_reload_level) {
+                g_debug.req_reload_level = 0;
+                load_level_runtime(g_app.level_name);
+                goto render_frame;
             }
 
             /* Wireframe toggle */
@@ -2835,6 +3219,15 @@ int main(int argc, char **argv) {
         app_shutdown();
         return code;
     }
+    if (g_app.cutscene_cli[0]) {
+        /* --cutscene <name>: play one cinematic and exit (manual test). With
+         * --screenshot <path>, instead render one representative frame headless
+         * and save it (automated verification of the in-engine video path). */
+        if (g_app.screenshot_path[0]) cutscene_shot(g_app.cutscene_cli, g_app.screenshot_path);
+        else cutscene_play(g_app.cutscene_cli);
+        app_shutdown();
+        return 0;
+    }
     if (g_app.check_mode) {
         /* OL_LINETEST: verify LINE-trigger SPAWN_LEVEL — cross each resolved
          * line trigger's segment perpendicularly and report what fires. */
@@ -2950,6 +3343,23 @@ int main(int argc, char **argv) {
         int code = print_level_check();
         app_shutdown();
         return code;
+    }
+    /* OL_LOADSHOT: draw one loading-screen frame (60%) and screenshot it. */
+    if (getenv("OL_LOADSHOT") && g_app.screenshot_path[0]) {
+        SDL_SetWindowSize(g_app.renderer.window, 800, 600);
+        renderer_resize(&g_app.renderer, 800, 600);
+        renderer_begin_frame(&g_app.renderer);
+        renderer_draw_loading(&g_app.renderer, g_app.loading_bg_tex, 0.6f, "TOWN");
+        int w = g_app.renderer.cfg.width, h = g_app.renderer.cfg.height;
+        u8 *px = (u8*)malloc((size_t)w*h*4);
+        glReadPixels(0,0,w,h,GL_RGBA,GL_UNSIGNED_BYTE,px);
+        u8 *fl = (u8*)malloc((size_t)w*h*4);
+        for (int y=0;y<h;y++) memcpy(fl+(size_t)(h-1-y)*w*4, px+(size_t)y*w*4,(size_t)w*4);
+        SDL_Surface *sf=SDL_CreateRGBSurfaceFrom(fl,w,h,32,w*4,0xFF,0xFF00,0xFF0000,0xFF000000);
+        if (sf){ SDL_SaveBMP(sf,g_app.screenshot_path); SDL_FreeSurface(sf); }
+        free(fl); free(px);
+        app_shutdown();
+        return 0;
     }
     app_run();
     app_shutdown();

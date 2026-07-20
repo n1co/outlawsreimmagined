@@ -62,6 +62,7 @@ set(ENGINE_SOURCES
     src/menu.c
     src/laf.c
     src/savegame.c
+    src/smush.c
 )
 
 # ImGui (C++ compiled separately)

@@ -327,3 +327,9 @@ bool inf_is_scroll_floor(const InfSystem *inf, u32 sector_idx);
  * renderer to draw the swinging door panel from the (moving) leaf sector rather
  * than the static neighbour, so the open/close animation is visible. */
 bool inf_is_morph_door(const InfSystem *inf, u32 sector_idx);
+
+/* If `sector_idx` is controlled by a door elevator, return its INF name (and
+ * *needed_key = its required InfKeyType, or INF_KEY_NONE). Returns NULL if the
+ * sector has no door. For the debug "Looking At" inspector. */
+const char *inf_door_name_for_sector(const InfSystem *inf, u32 sector_idx,
+                                     int *needed_key);
