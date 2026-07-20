@@ -31,6 +31,9 @@ typedef enum {
     ELEV_TYPE_MORPH_SPIN,   /* Rotates the sector's vertices around CENTER (swinging door) */
     ELEV_TYPE_CHANGE_LIGHT, /* Animates the sector's ambient light between stops */
     ELEV_TYPE_EXPLODE,      /* One-shot: detonates (damage + sound) when triggered */
+    ELEV_TYPE_FLAG_DOOR,    /* Auto mask-scroll door from sector flag 0x100: the
+                             * ADJOIN_MID panel slides out of view and the passage
+                             * opens. current_y = open amount 0..1. */
 } ElevType;
 
 /* A message fired when an elevator reaches a stop:
@@ -120,6 +123,12 @@ typedef struct {
     char      self_client[64];
     i32       self_client_sector;  /* -1 = SYSTEM/unresolved */
     bool      self_to_system;
+
+    /* Flag-door (0x100) stacked partner: the vertically-adjacent sector sharing
+     * this door's XZ footprint (e.g. HIDEOUT: a 0x100 transom sits above the
+     * 0x200 walk-through leaf). It opens/closes together so the whole doorway
+     * clears. -1 = none. */
+    i32       stack_partner;
 } Elevator;
 
 /* Key / tool types (Outlaws pickups: GSTEEKEY, GIRONKEY, GBRSSKEY, GRKEY,
@@ -309,6 +318,17 @@ void inf_auto_doors(InfSystem *inf, const LvtLevel *level,
 
 /* Resolve sector names to indices using a parsed level. Call after inf_load + lvt_parse. */
 void inf_resolve_sectors(InfSystem *inf, const LvtLevel *level);
+
+/*
+ * Auto-create doors from the sector DOOR flag (LVT_SEC_FLAG_DOOR / 0x200).
+ * Outlaws (like the Jedi engine) turns any sector flagged as a door into a
+ * standard door WITHOUT an explicit INF entry: a ceiling elevator whose closed
+ * position is the floor and whose open position is the authored ceiling. The
+ * sector is closed on load. Call after inf_resolve_sectors and before building
+ * the render mesh (it lowers the ceiling of each door sector). Non-const: it
+ * modifies each door sector's ceiling.
+ */
+void inf_create_flag_doors(InfSystem *inf, LvtLevel *level);
 
 /* Get current floor_y for a sector (returns false if not controlled) */
 bool inf_get_floor(const InfSystem *inf, u32 sector_idx, f32 *floor_y);

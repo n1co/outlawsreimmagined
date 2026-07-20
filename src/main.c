@@ -3055,7 +3055,8 @@ static int check_doors(void) {
         bool is_door = (el->type == ELEV_TYPE_MORPH_MOVE ||
                         el->type == ELEV_TYPE_MORPH_SPIN ||
                         el->type == ELEV_TYPE_DOOR ||
-                        el->type == ELEV_TYPE_INV_DOOR);
+                        el->type == ELEV_TYPE_INV_DOOR ||
+                        el->type == ELEV_TYPE_FLAG_DOOR);
         if (!is_door) continue;
         total++;
 
@@ -3094,36 +3095,46 @@ static int check_doors(void) {
             collision_wall_is_solid(lvt, (int)D, adjw, testy, PLAYER_BODY_HEIGHT);
 
         /* Realistic standing spot: the player can't stand IN the closed door, so
-         * approach from the doorway on the NEIGHBOUR side. Use the doorway wall
-         * midpoint nudged a few units into the adjoining sector. */
-        f32 ax = cx, az = cz;
+         * approach head-on from the doorway on the NEIGHBOUR side. Stand a few
+         * units off the doorway wall along its NORMAL (not toward the room
+         * centroid — that skews for big/concave rooms and, with several door
+         * leaves around one room, aims at a sibling). Facing straight down the
+         * normal isolates the door the player is actually looking at. */
+        f32 ax = cx, az = cz, aimx = 0, aimz = 1;
         if (adjw >= 0) {
             const LvtWall *dw = &sec->walls[adjw];
             if (dw->v1 >= 0 && dw->v2 >= 0 &&
                 dw->v1 < (i32)sec->vertex_count && dw->v2 < (i32)sec->vertex_count) {
                 f32 mx = (sec->vertices[dw->v1].x + sec->vertices[dw->v2].x) * 0.5f;
                 f32 mz = (sec->vertices[dw->v1].y + sec->vertices[dw->v2].y) * 0.5f;
-                const LvtSector *nb = &lvt->sectors[dw->adjoin];
-                f32 ncx = 0, ncz = 0;
-                for (u32 v = 0; v < nb->vertex_count; v++) { ncx += nb->vertices[v].x; ncz += nb->vertices[v].y; }
-                if (nb->vertex_count) { ncx /= nb->vertex_count; ncz /= nb->vertex_count; }
-                f32 dx = ncx - mx, dz = ncz - mz, dl = sqrtf(dx*dx + dz*dz);
-                if (dl > 1e-3f) { ax = mx + dx/dl * 4.0f; az = mz + dz/dl * 4.0f; }
-                else { ax = mx; az = mz; }
+                f32 ex = sec->vertices[dw->v2].x - sec->vertices[dw->v1].x;
+                f32 ez = sec->vertices[dw->v2].y - sec->vertices[dw->v1].y;
+                f32 nl = sqrtf(ex*ex + ez*ez);
+                f32 nx = nl > 1e-3f ? -ez/nl : 0, nz = nl > 1e-3f ? ex/nl : 1;
+                /* Pick the normal side that lands in the neighbour room (the side
+                 * the player stands on), then aim back through the door. */
+                i32 pn = collision_find_sector(lvt, mx + nx*3.0f, mz + nz*3.0f, 0);
+                f32 sgn = (pn == (i32)D || pn < 0) ? -1.0f : 1.0f;
+                ax = mx + nx*3.0f*sgn; az = mz + nz*3.0f*sgn;
+                aimx = -nx*sgn; aimz = -nz*sgn;
             }
         }
-
-        /* Use the REAL in-game USE path: inf_nudge_door_near (22u radius) from the
-         * doorway — this is what pressing E does. A direct by-sector nudge would
-         * falsely pass doors the player can't actually reach. */
         int nk = 0;
-        /* 1) nudge without any key */
-        InfDoorResult r0 = inf_nudge_door_near(inf, lvt, ax, az, 22.0f, 0, &nk);
+        /* 1) nudge without any key (ray first, then proximity). The ray reach is
+         * short (≈ the approach distance) so clustered door leaves sharing a room
+         * are isolated — the player opens the one they face, not a neighbour. */
+        InfDoorResult r0 = inf_nudge_door_ray(inf, lvt, ax, az, testy,
+                                              aimx, aimz, 0.0f, 10.0f, 0, &nk);
+        if (r0 == INF_DOOR_NONE)
+            r0 = inf_nudge_door_near(inf, lvt, ax, az, 22.0f, 0, &nk);
         bool use_reaches = (r0 != INF_DOOR_NONE);
         /* 2) if it refused (locked), nudge again holding the required key */
         InfDoorResult r1 = r0;
         if (r0 == INF_DOOR_LOCKED && !perm) {
-            r1 = inf_nudge_door_near(inf, lvt, ax, az, 22.0f, (1u << el->required_key), &nk);
+            u32 keym = (1u << el->required_key);
+            r1 = inf_nudge_door_ray(inf, lvt, ax, az, testy, aimx, aimz, 0.0f, 24.0f, keym, &nk);
+            if (r1 == INF_DOOR_NONE || r1 == INF_DOOR_LOCKED)
+                r1 = inf_nudge_door_near(inf, lvt, ax, az, 22.0f, keym, &nk);
         }
         /* 3) advance the morph/elevator to fully open (10 s @ 60 Hz) */
         for (int f = 0; f < 600; f++) inf_update(inf, 1.0f/60.0f, lvt);
@@ -3159,6 +3170,15 @@ static int check_doors(void) {
         }
 
         if (ok) pass++;
+        if (getenv("OL_DIRECT")) {
+            /* Ground-truth: nudge the door's OWN sector directly (bypasses the
+             * reach/approach heuristic) to confirm the elevator itself opens. */
+            f32 y0 = el->current_y;
+            int nk2 = 0; inf_nudge_door(inf, D, ~0u, &nk2);
+            for (int f = 0; f < 120; f++) inf_update(inf, 1.0f/60.0f, lvt);
+            printf("    DIRECT nudge sec %u: y %.1f -> %.1f (%s)\n", D, y0, el->current_y,
+                   fabsf(el->current_y - el->stops[0].y) > 0.5f ? "OPENED" : "stuck");
+        }
         if (getenv("OL_DOOR_AT"))
             printf("    approach (%.0f,%.0f) floor=%.0f\n", ax, az, sec->floor_y);
         printf("  %-12s %-4u %-7s %-8s %-6s %-8s %-8s %-5s %-6s %s\n",

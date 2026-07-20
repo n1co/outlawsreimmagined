@@ -1187,10 +1187,36 @@ bool renderer_build_level(Renderer *r, const LvtLevel *level, const InfSystem *i
                                         wall_light, wall->flags, tw, th);
                         EMIT_SIGN(wall->top.offset.u, aC0, sC0, aC1, sC1);
                     }
-                    /* BOT strip: sec_floor → adj_floor */
+                    /* BOT strip: sec_floor → adj_floor. This lower strip IS the
+                     * flag-door leaf when the adjoining sector is an auto door
+                     * (its BOT texture is the door panel, e.g. HIDEOUT tex 12):
+                     * as the door opens its bottom edge rises (door_slide 0→1) so
+                     * it slides up out of the doorway, then vanishes. */
                     if (has_bot && bot_tex > 0 && bot_tex != default_pcx_tex) {
+                        f32 dx0 = x0, dz0 = z0, dx1 = x1, dz1 = z1;
+                        const LvtSector *da = &level->sectors[wall->adjoin];
+                        if (da->is_flag_door && da->door_slide > 0.0f &&
+                            da->vertex_count > 0) {
+                            /* Hinged (swinging) door: this BOT strip is a face of
+                             * the door leaf. Revolve the WHOLE leaf as one rigid
+                             * slab about a single hinge corner (a fixed vertex of
+                             * the door sector) so both faces swing together the
+                             * same way — like the building's lower swing doors —
+                             * instead of each face hinging on its own edge (which
+                             * splayed them in opposite directions). Render-only;
+                             * sector geometry/adjoins untouched. Flag 0x200 flips
+                             * the swing direction. */
+                            f32 ang = da->door_slide * 1.4835f;   /* 85° in radians */
+                            if (sec->flags & LVT_SEC_FLAG_DOOR_DOWN) ang = -ang;
+                            f32 ca = cosf(ang), sa = sinf(ang);
+                            f32 hx = da->vertices[0].x, hz = da->vertices[0].y;
+                            f32 e0x = x0 - hx, e0z = z0 - hz;
+                            f32 e1x = x1 - hx, e1z = z1 - hz;
+                            dx0 = hx + e0x*ca - e0z*sa; dz0 = hz + e0x*sa + e0z*ca;
+                            dx1 = hx + e1x*ca - e1z*sa; dz1 = hz + e1x*sa + e1z*ca;
+                        }
                         u32 tw, th; tex_dims(r, bot_tex, &tw, &th);
-                        build_wall_quad(&builders[bot_tex], x0, z0, x1, z1,
+                        build_wall_quad(&builders[bot_tex], dx0, dz0, dx1, dz1,
                                         sF0, aF0, sF1, aF1,
                                         wall->bot.offset.u, wall->bot.offset.v,
                                         wall_light, wall->flags, tw, th);
@@ -1215,6 +1241,7 @@ bool renderer_build_level(Renderer *r, const LvtLevel *level, const InfSystem *i
                                             wall_light, wall->flags, mw, mh);
                         }
                     }
+
                 }
             }
         }

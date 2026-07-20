@@ -34,6 +34,15 @@
  * sloped floor / sloped ceiling (set by the loader from SLOPEDFLOOR/CEILING). */
 #define LVT_SEC_FLAG_SKY_CEIL   0x1u  /* Ceiling rendered as parallax sky */
 #define LVT_SEC_FLAG_SKY_FLOOR  0x2u  /* Floor rendered as parallax sky (pit) */
+/* Bit 8 (0x100): sector is an automatic DOOR — Outlaws auto-creates a mask-
+ * scroll door for it at level load with no INF entry (level_LoadSectors @0x41de4c
+ * tests flags1 & 0x100 → FUN_0045cbb0 case 6). The door panel is the ADJOIN_MID
+ * mask on its walls; opening slides the panel out of view and opens the passage.
+ * Bit 9 (0x200) = the door opens DOWNWARD instead of up (direction). NOTE: 0x200
+ * WITHOUT 0x100 is NOT a door (just a vestigial direction bit) — see
+ * project_doors_flag memory. */
+#define LVT_SEC_FLAG_DOOR       0x100u
+#define LVT_SEC_FLAG_DOOR_DOWN  0x200u
 
 /* Wall flags (first word) — from LVT binary analysis */
 #define LVT_WALL_FLAG_SKY_BOUNDARY  0x20000u  /* Sky-boundary portal wall: skip rendering */
@@ -112,6 +121,14 @@ typedef struct {
      * collision treats this sector's walls as passable so the player can walk
      * through the open door. */
     bool door_open;
+
+    /* Flag-door (LVT_SEC_FLAG_DOOR / 0x100): an auto-created mask-scroll door
+     * with no INF entry. When true, this sector's ADJOIN_MID panel walls are
+     * SOLID while the door is shut (door_open == false) and the panel is drawn;
+     * once opened they become passable (via door_open) and the panel is hidden.
+     * door_slide is the 0..1 open amount (for the sliding-panel animation). */
+    bool is_flag_door;
+    f32  door_slide;
 } LvtSector;
 
 /* Complete parsed level */

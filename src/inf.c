@@ -548,6 +548,76 @@ void inf_resolve_sectors(InfSystem *inf, const LvtLevel *level) {
            resolved, morph, locks, unresolved, tr_res, inf->trigger_count);
 }
 
+void inf_create_flag_doors(InfSystem *inf, LvtLevel *level) {
+    u32 created = 0;
+    for (u32 s = 0; s < level->sector_count; s++) {
+        LvtSector *sec = &level->sectors[s];
+        /* Only the real door flag (0x100). 0x200 WITHOUT 0x100 is NOT a door
+         * (vestigial direction bit — e.g. HIDEOUT 77/82/83 sealed panels). */
+        if (!(sec->flags & LVT_SEC_FLAG_DOOR)) continue;
+        /* Skip if an INF elevator already controls this sector (scripted doors,
+         * lifts, morphs take precedence over the auto-door flag). */
+        bool taken = false;
+        for (u32 i = 0; i < inf->count; i++)
+            if (inf->elevs[i].active && inf->elevs[i].sector_idx == s) { taken = true; break; }
+        if (taken) continue;
+        if (inf->count >= INF_MAX_ELEVS) {
+            OL_WARN("INF: elevator table full, %u door sectors left without auto-doors\n",
+                    level->sector_count - s);
+            break;
+        }
+        Elevator *el = &inf->elevs[inf->count++];
+        memset(el, 0, sizeof(*el));
+        el->active      = true;
+        el->master      = true;
+        el->sector_idx  = s;
+        el->type        = ELEV_TYPE_FLAG_DOOR;   /* mask-scroll door */
+        el->speed       = 2.0f;                  /* open amount/s → ~0.5s slide */
+        el->stop_count  = 2;
+        el->stops[0].y     = 0.0f;   el->stops[0].delay = 1e9f;  /* closed, HOLD */
+        el->stops[1].y     = 1.0f;   el->stops[1].delay = 1e9f;  /* open,   HOLD */
+        el->current_stop = 0; el->next_stop = 0;
+        el->current_y = 0.0f; el->target_y = 0.0f;
+        el->delay_timer = 1e9f; el->moving = false;
+        el->required_key = INF_KEY_NONE;
+        el->stack_partner = -1;
+        snprintf(el->sound_file, sizeof(el->sound_file), "DOOR3.WAV");
+        /* Mark the sector so collision blocks its panel walls while shut and the
+         * renderer draws/hides the panel by door state. Start CLOSED. */
+        sec->is_flag_door = true;
+        sec->door_open    = false;
+        sec->door_slide   = 0.0f;
+
+        /* Find a stacked partner: a sector sharing this door's XZ footprint whose
+         * ceiling meets this floor (or floor meets this ceiling) — the doorway is
+         * split vertically (walk-through leaf + transom). It opens as one. */
+        f32 cx = 0, cz = 0;
+        for (u32 v = 0; v < sec->vertex_count; v++) { cx += sec->vertices[v].x; cz += sec->vertices[v].y; }
+        if (sec->vertex_count) { cx /= sec->vertex_count; cz /= sec->vertex_count; }
+        for (u32 p = 0; p < level->sector_count; p++) {
+            if (p == s) continue;
+            LvtSector *ps = &level->sectors[p];
+            if (ps->vertex_count == 0) continue;
+            f32 px = 0, pz = 0;
+            for (u32 v = 0; v < ps->vertex_count; v++) { px += ps->vertices[v].x; pz += ps->vertices[v].y; }
+            px /= ps->vertex_count; pz /= ps->vertex_count;
+            if (fabsf(px - cx) > 2.0f || fabsf(pz - cz) > 2.0f) continue;  /* same column */
+            if (fabsf(ps->ceil_y - sec->floor_y) < 0.5f ||
+                fabsf(ps->floor_y - sec->ceil_y) < 0.5f) {
+                el->stack_partner = (i32)p;
+                ps->is_flag_door = true;   /* opens/closes with the master */
+                ps->door_open    = false;
+                ps->door_slide   = 0.0f;
+                break;
+            }
+        }
+        created++;
+    }
+    if (created)
+        OL_LOG("INF: auto-created %u flag-door(s) (sector DOOR flag 0x%X)\n",
+               created, LVT_SEC_FLAG_DOOR);
+}
+
 /* ---- Locked doors: key classification from the door sector name ---- */
 const char *inf_key_name(int key) {
     switch (key) {
@@ -640,11 +710,16 @@ InfDoorResult inf_nudge_door(InfSystem *inf, u32 sector_idx,
     InfDoorResult res = INF_DOOR_NONE;
     for (u32 i = 0; i < inf->count; i++) {
         Elevator *el = &inf->elevs[i];
-        if (!el->active || el->sector_idx != sector_idx) continue;
+        /* Match the door's own sector, or a flag-door whose stacked partner is
+         * this sector (so nudging the walk-through leaf opens the whole door). */
+        if (!el->active ||
+            (el->sector_idx != sector_idx && el->stack_partner != (i32)sector_idx))
+            continue;
         bool is_door = (el->type == ELEV_TYPE_MORPH_MOVE ||
                         el->type == ELEV_TYPE_MORPH_SPIN ||
                         el->type == ELEV_TYPE_DOOR ||
                         el->type == ELEV_TYPE_INV_DOOR ||
+                        el->type == ELEV_TYPE_FLAG_DOOR ||
                         el->type == ELEV_TYPE_MOVE_FLOOR);
         if (!is_door) continue;
 
@@ -709,7 +784,7 @@ InfDoorResult inf_nudge_door(InfSystem *inf, u32 sector_idx,
 static bool elev_is_door(const Elevator *el) {
     return el->type == ELEV_TYPE_MORPH_MOVE || el->type == ELEV_TYPE_MORPH_SPIN ||
            el->type == ELEV_TYPE_DOOR || el->type == ELEV_TYPE_INV_DOOR ||
-           el->type == ELEV_TYPE_MOVE_FLOOR;
+           el->type == ELEV_TYPE_FLAG_DOOR || el->type == ELEV_TYPE_MOVE_FLOOR;
 }
 
 static void door_centroid(const LvtLevel *level, const Elevator *el,
@@ -786,11 +861,14 @@ static InfDoorResult inf_nudge_door_group(InfSystem *inf, const LvtLevel *level,
                                           u32 target, u32 have_keys,
                                           int *needed_key) {
     if (target >= level->sector_count) return INF_DOOR_NONE;
-    /* Find a door elevator on `target`; if none, nothing to group around. */
+    /* Find a door elevator on `target` (or a flag-door whose stacked partner is
+     * `target` — nudging the walk-through leaf opens its transom's door); if
+     * none, nothing to group around. */
     f32 tcx = 0, tcz = 0; bool have_c = false;
     for (u32 i = 0; i < inf->count; i++) {
         Elevator *el = &inf->elevs[i];
-        if (el->active && elev_is_door(el) && el->sector_idx == target) {
+        if (el->active && elev_is_door(el) &&
+            (el->sector_idx == target || el->stack_partner == (i32)target)) {
             door_centroid(level, el, &tcx, &tcz); have_c = true; break;
         }
     }
@@ -1235,6 +1313,18 @@ void inf_update(InfSystem *inf, f32 dt, LvtLevel *level) {
             break;
         case ELEV_TYPE_INV_DOOR:
             sec->floor_y = el->current_y;
+            break;
+        case ELEV_TYPE_FLAG_DOOR:
+            /* current_y is the 0..1 open amount: slide the panel and open the
+             * passage (collision uses door_open) once it is ≥ half open. */
+            sec->door_slide = el->current_y;
+            sec->door_open  = (el->current_y >= 0.5f);
+            /* The stacked partner (walk-through leaf under a transom, etc.)
+             * opens with the master so the whole doorway clears. */
+            if (el->stack_partner >= 0 && el->stack_partner < (i32)level->sector_count) {
+                level->sectors[el->stack_partner].door_slide = el->current_y;
+                level->sectors[el->stack_partner].door_open  = (el->current_y >= 0.5f);
+            }
             break;
         case ELEV_TYPE_MORPH_MOVE:
         case ELEV_TYPE_MORPH_SPIN: {

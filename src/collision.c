@@ -226,6 +226,12 @@ static bool wall_is_solid(const LvtLevel *level, i32 si, u32 wi,
     if (sec->door_open) return false;
     if (level->sectors[w->adjoin].door_open) return false;
 
+    /* Closed flag-door (auto mask-scroll door, sector flag 0x100): its panel
+     * blocks until opened. Without this the panel's ADJOIN_MID wall would fall
+     * through to the geometric check and read as an open portal. */
+    if (sec->is_flag_door) return true;
+    if (level->sectors[w->adjoin].is_flag_door) return true;
+
     /* WF3_SOLID_WALL (flags2 bit 1): explicitly solid. */
     if (w->flags2 & 0x02u)
         return true;

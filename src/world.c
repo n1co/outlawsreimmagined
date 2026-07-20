@@ -1076,6 +1076,11 @@ bool world_load(World *world, Archives *arc,
             inf_load(&world->inf, (const char *)inf_data, inf_size);
             inf_resolve_sectors(&world->inf, &world->lvt);
             inf_resolve_lines(&world->inf, &world->lvt);   /* LINE trigger walls */
+            /* Auto-create the flag-doors (sector flag 0x100): Outlaws mask-scroll
+             * doors that have no INF entry (level_LoadSectors @0x41de4c). Must run
+             * before renderer_build_level. Only real 0x100 doors — not the 0x200-
+             * only sealed panels. See project_doors_flag memory. */
+            inf_create_flag_doors(&world->inf, &world->lvt);
             OL_LOG("INF loaded: %u elevators/doors\n", world->inf.count);
         }
     }
