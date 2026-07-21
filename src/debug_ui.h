@@ -13,6 +13,7 @@
 
 #include <SDL2/SDL.h>
 #include <stdbool.h>
+#include "postfx.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -86,6 +87,10 @@ typedef struct {
     /* Requests back to the game (one-shot) */
     int   req_reload_level;    /* debug: reload current level */
     int   req_set_difficulty;  /* 0 = none, else 1..4 to apply+reload */
+
+    /* Post-processing (pretty shaders) — edited live by the debug UI, copied
+     * into the renderer each frame by main.c. */
+    PostFX postfx;
 } DebugState;
 
 /* Push one FPS sample into the ring buffer (call each frame). */

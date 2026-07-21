@@ -17,6 +17,7 @@
 #include "entity.h"
 #include "weapon.h"
 #include "inf.h"
+#include "postfx.h"
 #include <GL/glew.h>
 #include <SDL2/SDL.h>
 
@@ -223,6 +224,19 @@ typedef struct {
     f32 *tdo_data[R_MAX_TDO];     /* 9 floats/vert: pos3 uv2 rgba4 */
     u32  tdo_vcount[R_MAX_TDO];
     u32  tdo_count;
+
+    /* -------- Post-processing (optional pretty shaders) -------- *
+     * When post.enabled, begin_frame binds post_fbo; the scene + HUD render into
+     * it; renderer_post_resolve() draws a fullscreen quad through prog_post to the
+     * backbuffer. Debug UI / pause menu draw AFTER the resolve so they stay crisp. */
+    PostFX post;
+    GLuint post_fbo;             /* offscreen framebuffer */
+    GLuint post_color;           /* color attachment (sampled by the post shader) */
+    GLuint post_depth;           /* depth renderbuffer */
+    GLuint prog_post;            /* fullscreen post-process program */
+    GLuint post_vao, post_vbo;   /* fullscreen quad */
+    int    post_w, post_h;       /* current size of the attachments */
+    bool   post_resolved;        /* resolve already done this frame? */
 } Renderer;
 
 /* Initialize renderer, create window and GL context. Returns false on error. */
@@ -234,8 +248,14 @@ void renderer_shutdown(Renderer *r);
 /* Begin a new frame (clear buffers). */
 void renderer_begin_frame(Renderer *r);
 
-/* End frame (swap buffers). */
+/* End frame (swap buffers). Resolves the post-process pass first if it hasn't
+ * been resolved explicitly this frame. */
 void renderer_end_frame(Renderer *r);
+
+/* Resolve the offscreen scene to the backbuffer through the post-process shader
+ * (no-op if post-FX is disabled or already resolved this frame). Call this right
+ * before drawing UI that must stay crisp (debug overlay, pause menu). */
+void renderer_post_resolve(Renderer *r);
 
 /* Upload a texture to GPU. Returns texture index+1 (or 0 on error). */
 u32 renderer_upload_texture(Renderer *r, const char *name,

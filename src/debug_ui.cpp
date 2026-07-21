@@ -260,6 +260,82 @@ void debug_ui_render(void) {
     }
     ImGui::End();
 
+    /* ---- Shaders / Post-FX (pretty shaders) ---- */
+    ImGui::SetNextWindowPos(ImVec2(650, 10), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(330, 430), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Shaders / Post-FX", nullptr, WF)) {
+        PostFX &fx = g_debug.postfx;
+        ImGui::Checkbox("Enable post-processing", &fx.enabled);
+        ImGui::TextDisabled("Optional eye-candy — off = pixel-faithful.");
+        ImGui::Separator();
+
+        static const char *presets[] = {
+            "Off", "CRT (arcade)", "Cinematic", "Vibrant", "Custom" };
+        int pr = fx.preset;
+        if (pr < 0 || pr >= POST_PRESET_COUNT) pr = 0;
+        ImGui::TextUnformatted("Preset");
+        if (ImGui::Combo("##preset", &pr, presets, POST_PRESET_COUNT)) {
+            if (pr == POST_PRESET_OFF) {
+                fx.enabled = false; fx.preset = POST_PRESET_OFF;
+            } else if (pr != POST_PRESET_CUSTOM) {
+                postfx_apply_preset(&fx, pr);   /* turns fx.enabled on */
+            } else {
+                fx.preset = POST_PRESET_CUSTOM;
+            }
+        }
+        ImGui::Separator();
+        ImGui::BeginDisabled(!fx.enabled);
+
+        /* Any manual edit switches the preset label to "Custom". */
+        bool edited = false;
+        ImGui::TextDisabled("Effects");
+        edited |= ImGui::Checkbox("CRT (curve+scanlines+mask)", &fx.crt);
+        if (fx.crt) {
+            ImGui::Indent();
+            edited |= ImGui::SliderFloat("Curvature", &fx.curvature, 0.0f, 0.3f);
+            edited |= ImGui::SliderFloat("Scanlines", &fx.scanline, 0.0f, 1.0f);
+            edited |= ImGui::SliderFloat("Aperture mask", &fx.mask, 0.0f, 1.0f);
+            ImGui::Unindent();
+        }
+        edited |= ImGui::Checkbox("Bloom / glow", &fx.bloom);
+        if (fx.bloom) {
+            ImGui::Indent();
+            edited |= ImGui::SliderFloat("Intensity", &fx.bloom_amt, 0.0f, 2.0f);
+            edited |= ImGui::SliderFloat("Threshold", &fx.bloom_thresh, 0.0f, 1.0f);
+            ImGui::Unindent();
+        }
+        edited |= ImGui::Checkbox("Chromatic aberration", &fx.chromatic);
+        if (fx.chromatic) {
+            ImGui::Indent();
+            edited |= ImGui::SliderFloat("Amount (px)", &fx.chroma_amt, 0.0f, 6.0f);
+            ImGui::Unindent();
+        }
+        edited |= ImGui::Checkbox("Vignette", &fx.vignette);
+        if (fx.vignette) {
+            ImGui::Indent();
+            edited |= ImGui::SliderFloat("Strength", &fx.vignette_amt, 0.0f, 1.5f);
+            ImGui::Unindent();
+        }
+        edited |= ImGui::Checkbox("Film grain", &fx.grain);
+        if (fx.grain) {
+            ImGui::Indent();
+            edited |= ImGui::SliderFloat("Grain", &fx.grain_amt, 0.0f, 0.25f);
+            ImGui::Unindent();
+        }
+        edited |= ImGui::Checkbox("Colour grade", &fx.grade);
+        if (fx.grade) {
+            ImGui::Indent();
+            edited |= ImGui::SliderFloat("Saturation", &fx.saturation, 0.0f, 2.0f);
+            edited |= ImGui::SliderFloat("Contrast", &fx.contrast, 0.5f, 2.0f);
+            edited |= ImGui::SliderFloat("Gamma", &fx.gamma, 0.5f, 2.5f);
+            ImGui::Unindent();
+        }
+        if (edited) fx.preset = POST_PRESET_CUSTOM;
+
+        ImGui::EndDisabled();
+    }
+    ImGui::End();
+
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 }

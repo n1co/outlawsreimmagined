@@ -1464,6 +1464,17 @@ static bool app_init(int argc, char **argv) {
 
     /* Debug UI (ImGui) */
     debug_ui_init(g_app.renderer.window, g_app.renderer.gl_ctx);
+    /* Post-FX off by default, but seed sensible slider values (so enabling an
+     * effect manually starts from a good baseline, not zeros). */
+    postfx_apply_preset(&g_debug.postfx, POST_PRESET_OFF);
+    /* OL_POSTFX=1..3 applies a preset at startup (1=CRT 2=Cinematic 3=Vibrant)
+     * for quick demos / headless screenshots; the debug menu overrides it. */
+    {
+        const char *pf = getenv("OL_POSTFX");
+        int pr = pf ? atoi(pf) : 0;
+        if (pr >= POST_PRESET_CRT && pr < POST_PRESET_COUNT)
+            postfx_apply_preset(&g_debug.postfx, pr);
+    }
 
     /* Audio */
     if (!audio_init(&g_app.audio))
@@ -2064,6 +2075,9 @@ static void app_run(void) {
                 renderer_resize(&g_app.renderer, w, h);
         }
 
+        /* Live post-processing params from the debug menu → renderer. */
+        g_app.renderer.post = g_debug.postfx;
+
         /* ---- Front-end menu (main / mission select / options) ---- */
         if (g_app.in_menu) {
             g_app.input.suppress_capture = true;        /* don't grab on click */
@@ -2095,6 +2109,7 @@ static void app_run(void) {
                     input_capture_mouse(&g_app.input, true);
                 }
             }
+            renderer_post_resolve(&g_app.renderer);  /* keep menu debug UI crisp */
             debug_ui_render();
             renderer_end_frame(&g_app.renderer);
             screenshot_tick(&frame_no);
@@ -3030,6 +3045,10 @@ render_frame:
                 load_level_runtime(g_app.level_name);
                 goto render_frame;
             }
+
+            /* Resolve the post-FX pass now so the debug overlay draws crisp on
+             * top of the processed scene (not through the CRT/bloom shader). */
+            renderer_post_resolve(&g_app.renderer);
 
             /* Wireframe toggle */
             if (g_debug.wireframe)

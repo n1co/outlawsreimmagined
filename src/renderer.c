@@ -146,6 +146,99 @@ static const char *SKY_FRAG_SRC =
 "    fragColor = texture(uTex, uv);\n"   /* wraps via GL_REPEAT */
 "}\n";
 
+/* ---- Post-processing: fullscreen quad + multi-effect resolve ---- */
+static const char *POST_VERT_SRC =
+"#version 330 core\n"
+"layout(location=0) in vec2 aPos;\n"
+"out vec2 vUV;\n"
+"void main(){ vUV = aPos*0.5+0.5; gl_Position = vec4(aPos,0.0,1.0); }\n";
+
+static const char *POST_FRAG_SRC =
+"#version 330 core\n"
+"in vec2 vUV;\n"
+"out vec4 frag;\n"
+"uniform sampler2D uScene;\n"
+"uniform vec2  uRes;\n"
+"uniform float uTime;\n"
+"uniform int   uCRT;\n"
+"uniform int   uBloom;\n"
+"uniform int   uChroma;\n"
+"uniform int   uVig;\n"
+"uniform int   uGrain;\n"
+"uniform int   uGrade;\n"
+"uniform float uCurv;\n"
+"uniform float uScan;\n"
+"uniform float uMask;\n"
+"uniform float uBloomAmt;\n"
+"uniform float uBloomThr;\n"
+"uniform float uChromaAmt;\n"
+"uniform float uVigAmt;\n"
+"uniform float uGrainAmt;\n"
+"uniform float uSat;\n"
+"uniform float uCon;\n"
+"uniform float uGam;\n"
+"#define PI 3.14159265\n"
+"float luma(vec3 c){ return dot(c, vec3(0.299,0.587,0.114)); }\n"
+"float hash(vec2 p){ return fract(sin(dot(p, vec2(12.9898,78.233))) * 43758.5453); }\n"
+"vec2 crtCurve(vec2 uv){\n"
+"    uv = uv*2.0-1.0;\n"
+"    vec2 off = uv.yx*uv.yx*uCurv;\n"
+"    uv += uv*off;\n"
+"    return uv*0.5+0.5;\n"
+"}\n"
+"void main(){\n"
+"    vec2 uv = vUV;\n"
+"    if(uCRT==1) uv = crtCurve(uv);\n"
+"    bool outside = (uv.x<0.0||uv.x>1.0||uv.y<0.0||uv.y>1.0);\n"
+"    vec3 col;\n"
+"    if(uChroma==1){\n"
+"        vec2 dir = uv-0.5;\n"
+"        vec2 o = dir * (uChromaAmt/uRes);\n"
+"        col.r = texture(uScene, uv+o).r;\n"
+"        col.g = texture(uScene, uv).g;\n"
+"        col.b = texture(uScene, uv-o).b;\n"
+"    } else {\n"
+"        col = texture(uScene, uv).rgb;\n"
+"    }\n"
+"    if(uBloom==1){\n"
+"        vec3 b = vec3(0.0); float tot=0.0;\n"
+"        vec2 px = 1.0/uRes;\n"
+"        for(int x=-3;x<=3;x++){\n"
+"            for(int y=-3;y<=3;y++){\n"
+"                vec2 so = vec2(float(x),float(y))*px*1.5;\n"
+"                vec3 s = texture(uScene, uv+so).rgb;\n"
+"                float br = max(0.0, luma(s)-uBloomThr);\n"
+"                float w = exp(-float(x*x+y*y)/8.0);\n"
+"                b += s*br*w; tot += w;\n"
+"            }\n"
+"        }\n"
+"        b /= max(tot,0.001);\n"
+"        col += b*uBloomAmt;\n"
+"    }\n"
+"    if(uGrade==1){\n"
+"        col = mix(vec3(luma(col)), col, uSat);\n"          /* saturation */
+"        col = (col-0.5)*uCon+0.5;\n"                        /* contrast */
+"        col = pow(max(col,0.0), vec3(1.0/uGam));\n"         /* gamma */
+"    }\n"
+"    if(uCRT==1){\n"
+"        float sl = 0.5+0.5*sin(uv.y*uRes.y*PI);\n"
+"        col *= 1.0 - uScan*(1.0-sl);\n"
+"        float m = mod(gl_FragCoord.x, 3.0);\n"
+"        vec3 mask = (m<1.0)?vec3(1.0,0.7,0.7):(m<2.0)?vec3(0.7,1.0,0.7):vec3(0.7,0.7,1.0);\n"
+"        col *= mix(vec3(1.0), mask, uMask);\n"
+"    }\n"
+"    if(uVig==1){\n"
+"        float d = distance(uv, vec2(0.5));\n"
+"        col *= 1.0 - uVigAmt*smoothstep(0.35,0.85,d);\n"
+"    }\n"
+"    if(uGrain==1){\n"
+"        float g = hash(gl_FragCoord.xy + fract(uTime))-0.5;\n"
+"        col += g*uGrainAmt;\n"
+"    }\n"
+"    if(outside) col = vec3(0.0);\n"                         /* CRT overscan border */
+"    frag = vec4(clamp(col,0.0,1.0), 1.0);\n"
+"}\n";
+
 /* -------------------------------------------------------------------------
  * Shader compilation helpers
  * ---------------------------------------------------------------------- */
@@ -186,6 +279,8 @@ static GLuint link_program(const char *vert_src, const char *frag_src) {
 /* -------------------------------------------------------------------------
  * Renderer init / shutdown
  * ---------------------------------------------------------------------- */
+
+static void post_init(Renderer *r);          /* post-processing setup (below) */
 
 bool renderer_init(Renderer *r, const RenderConfig *cfg, const char *title) {
     memset(r, 0, sizeof(*r));
@@ -308,6 +403,9 @@ bool renderer_init(Renderer *r, const RenderConfig *cfg, const char *title) {
         glBindTexture(GL_TEXTURE_2D, 0);
     }
 
+    /* Post-processing pipeline (disabled by default; toggled via debug menu). */
+    post_init(r);
+
     OL_LOG("Renderer initialized (%dx%d)\n", cfg->width, cfg->height);
     return true;
 }
@@ -338,6 +436,12 @@ void renderer_shutdown(Renderer *r) {
     if (r->hud_vao)    { glDeleteVertexArrays(1, &r->hud_vao);    glDeleteBuffers(1, &r->hud_vbo); }
     if (r->missing_tex) glDeleteTextures(1, &r->missing_tex);
 
+    if (r->prog_post)   glDeleteProgram(r->prog_post);
+    if (r->post_vao)    { glDeleteVertexArrays(1, &r->post_vao); glDeleteBuffers(1, &r->post_vbo); }
+    if (r->post_color)  glDeleteTextures(1, &r->post_color);
+    if (r->post_depth)  glDeleteRenderbuffers(1, &r->post_depth);
+    if (r->post_fbo)    glDeleteFramebuffers(1, &r->post_fbo);
+
     if (r->gl_ctx)  SDL_GL_DeleteContext(r->gl_ctx);
     if (r->window)  SDL_DestroyWindow(r->window);
     SDL_Quit();
@@ -347,12 +451,117 @@ void renderer_shutdown(Renderer *r) {
  * Frame management
  * ---------------------------------------------------------------------- */
 
+/* -------------------------------------------------------------------------
+ * Post-processing (optional pretty shaders)
+ * ---------------------------------------------------------------------- */
+
+/* (Re)allocate the offscreen color texture + depth buffer to (w,h). */
+static void post_ensure_size(Renderer *r, int w, int h) {
+    if (w <= 0 || h <= 0) return;
+    if (r->post_color && r->post_w == w && r->post_h == h) return;
+    r->post_w = w; r->post_h = h;
+
+    if (!r->post_fbo) glGenFramebuffers(1, &r->post_fbo);
+    if (!r->post_color) glGenTextures(1, &r->post_color);
+    if (!r->post_depth) glGenRenderbuffers(1, &r->post_depth);
+
+    glBindTexture(GL_TEXTURE_2D, r->post_color);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    glBindRenderbuffer(GL_RENDERBUFFER, r->post_depth);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h);
+    glBindRenderbuffer(GL_RENDERBUFFER, 0);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, r->post_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, r->post_color, 0);
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, r->post_depth);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+        OL_ERR("Post FBO incomplete (%dx%d)\n", w, h);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+/* Compile the post program + fullscreen quad. Called from renderer_init. */
+static void post_init(Renderer *r) {
+    r->prog_post = link_program(POST_VERT_SRC, POST_FRAG_SRC);
+    if (!r->prog_post) { OL_ERR("Post shader failed to link\n"); return; }
+    static const f32 quad[] = { -1,-1,  1,-1,  -1,1,   -1,1,  1,-1,  1,1 };
+    glGenVertexArrays(1, &r->post_vao);
+    glGenBuffers(1, &r->post_vbo);
+    glBindVertexArray(r->post_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, r->post_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2*sizeof(f32), (void*)0);
+    glEnableVertexAttribArray(0);
+    glBindVertexArray(0);
+    post_ensure_size(r, r->cfg.width, r->cfg.height);
+}
+
+void renderer_post_resolve(Renderer *r) {
+    if (!r->post.enabled || !r->prog_post || r->post_resolved) return;
+    r->post_resolved = true;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glViewport(0, 0, r->cfg.width, r->cfg.height);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_BLEND);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    glUseProgram(r->prog_post);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, r->post_color);
+    const PostFX *p = &r->post;
+    glUniform1i(glGetUniformLocation(r->prog_post, "uScene"), 0);
+    glUniform2f(glGetUniformLocation(r->prog_post, "uRes"),
+                (f32)r->post_w, (f32)r->post_h);
+    glUniform1f(glGetUniformLocation(r->prog_post, "uTime"),
+                (f32)(SDL_GetTicks64() % 100000) / 1000.0f);
+    glUniform1i(glGetUniformLocation(r->prog_post, "uCRT"),    p->crt);
+    glUniform1i(glGetUniformLocation(r->prog_post, "uBloom"),  p->bloom);
+    glUniform1i(glGetUniformLocation(r->prog_post, "uChroma"), p->chromatic);
+    glUniform1i(glGetUniformLocation(r->prog_post, "uVig"),    p->vignette);
+    glUniform1i(glGetUniformLocation(r->prog_post, "uGrain"),  p->grain);
+    glUniform1i(glGetUniformLocation(r->prog_post, "uGrade"),  p->grade);
+    glUniform1f(glGetUniformLocation(r->prog_post, "uCurv"),      p->curvature);
+    glUniform1f(glGetUniformLocation(r->prog_post, "uScan"),      p->scanline);
+    glUniform1f(glGetUniformLocation(r->prog_post, "uMask"),      p->mask);
+    glUniform1f(glGetUniformLocation(r->prog_post, "uBloomAmt"),  p->bloom_amt);
+    glUniform1f(glGetUniformLocation(r->prog_post, "uBloomThr"),  p->bloom_thresh);
+    glUniform1f(glGetUniformLocation(r->prog_post, "uChromaAmt"), p->chroma_amt);
+    glUniform1f(glGetUniformLocation(r->prog_post, "uVigAmt"),    p->vignette_amt);
+    glUniform1f(glGetUniformLocation(r->prog_post, "uGrainAmt"),  p->grain_amt);
+    glUniform1f(glGetUniformLocation(r->prog_post, "uSat"),       p->saturation);
+    glUniform1f(glGetUniformLocation(r->prog_post, "uCon"),       p->contrast);
+    glUniform1f(glGetUniformLocation(r->prog_post, "uGam"),       p->gamma);
+
+    glBindVertexArray(r->post_vao);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glBindVertexArray(0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glUseProgram(0);
+    glEnable(GL_DEPTH_TEST);
+}
+
 void renderer_begin_frame(Renderer *r) {
-    (void)r;
+    r->post_resolved = false;
+    if (r->post.enabled && r->prog_post) {
+        post_ensure_size(r, r->cfg.width, r->cfg.height);
+        glBindFramebuffer(GL_FRAMEBUFFER, r->post_fbo);
+        glViewport(0, 0, r->post_w, r->post_h);
+    } else {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 }
 
 void renderer_end_frame(Renderer *r) {
+    /* If nothing resolved the offscreen buffer yet (paths without a UI pass),
+     * resolve it now so the frame is actually shown. */
+    if (r->post.enabled && !r->post_resolved) renderer_post_resolve(r);
     SDL_GL_SwapWindow(r->window);
 }
 
