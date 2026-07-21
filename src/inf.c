@@ -546,6 +546,7 @@ void inf_resolve_sectors(InfSystem *inf, const LvtLevel *level) {
 
     OL_LOG("INF resolve: %u resolved (%u morph doors, %u locks), %u unresolved; %u/%u triggers\n",
            resolved, morph, locks, unresolved, tr_res, inf->trigger_count);
+
 }
 
 void inf_create_flag_doors(InfSystem *inf, LvtLevel *level) {
@@ -795,9 +796,41 @@ static void door_centroid(const LvtLevel *level, const Elevator *el,
     *cx = n ? sx / n : 0; *cz = n ? sz / n : 0;
 }
 
-/* Distance (world units) within which the leaves of one doorway (double doors,
- * saloon doors, adjacent shutters) are nudged together by a single USE. */
-#define DOOR_GROUP_RADIUS 12.0f
+/* A door leaf that a single USE should co-open with its neighbour: a visible
+ * swinging/sliding panel — NOT a MOVE_FLOOR controller/dummy (those are invisible
+ * and must not be toggled by proximity). */
+static bool elev_is_leaf(const Elevator *el) {
+    return el->type == ELEV_TYPE_MORPH_MOVE || el->type == ELEV_TYPE_MORPH_SPIN ||
+           el->type == ELEV_TYPE_FLAG_DOOR  || el->type == ELEV_TYPE_DOOR ||
+           el->type == ELEV_TYPE_INV_DOOR;
+}
+
+static void door_bbox(const LvtLevel *level, const Elevator *el,
+                      f32 *minx, f32 *maxx, f32 *minz, f32 *maxz) {
+    const LvtSector *sec = &level->sectors[el->sector_idx];
+    f32 nx = 1e30f, xx = -1e30f, nz = 1e30f, xz = -1e30f;
+    for (u32 v = 0; v < sec->vertex_count; v++) {
+        f32 x = sec->vertices[v].x, z = sec->vertices[v].y;
+        if (x < nx) nx = x; if (x > xx) xx = x;
+        if (z < nz) nz = z; if (z > xz) xz = z;
+    }
+    *minx = nx; *maxx = xx; *minz = nz; *maxz = xz;
+}
+
+/* Two leaves belong to ONE doorway when their sector footprints touch/overlap
+ * (a split door's halves meet along the jamb). This replaces the old fixed-radius
+ * cluster, which wrongly swept in the NEXT doorway a few units away — e.g. TRAIN's
+ * wagon doors are ~9u apart, so pressing USE on one opened the whole car. */
+#define DOOR_ADJ_GAP 2.0f
+static bool doors_same_doorway(const LvtLevel *level,
+                               f32 anx, f32 axx, f32 anz, f32 axz,
+                               const Elevator *b) {
+    f32 bnx, bxx, bnz, bxz;
+    door_bbox(level, b, &bnx, &bxx, &bnz, &bxz);
+    bool xov = (anx - DOOR_ADJ_GAP <= bxx) && (bnx - DOOR_ADJ_GAP <= axx);
+    bool zov = (anz - DOOR_ADJ_GAP <= bxz) && (bnz - DOOR_ADJ_GAP <= axz);
+    return xov && zov;
+}
 
 InfDoorResult inf_nudge_door_near(InfSystem *inf, const LvtLevel *level,
                                   f32 px, f32 pz, f32 radius,
@@ -814,19 +847,23 @@ InfDoorResult inf_nudge_door_near(InfSystem *inf, const LvtLevel *level,
         if (d2 < best_d2) { best_d2 = d2; best = (i32)i; ncx = cx; ncz = cz; }
     }
     if (best < 0) return INF_DOOR_NONE;
+    (void)ncx; (void)ncz;
 
-    /* Nudge EVERY door leaf clustered around the nearest one, so a double door
-     * opens both halves with one press. Aggregate: a key used (UNLOCKED) wins,
-     * else a lock hint (LOCKED), else a plain open. */
+    /* Open the nearest door plus the other leaf of the SAME doorway (touching
+     * footprint), so a split/double door opens both halves — but not a separate
+     * doorway nearby. Aggregate: UNLOCKED wins, else LOCKED, else OPENED. */
+    f32 anx, axx, anz, axz;
+    door_bbox(level, &inf->elevs[best], &anx, &axx, &anz, &axz);
     InfDoorResult res = INF_DOOR_NONE;
     for (u32 i = 0; i < inf->count; i++) {
         Elevator *el = &inf->elevs[i];
         if (!el->active || !elev_is_door(el)) continue;
         if (el->sector_idx >= level->sector_count) continue;
         if (level->sectors[el->sector_idx].vertex_count == 0) continue;
-        f32 cx, cz; door_centroid(level, el, &cx, &cz);
-        f32 dx = ncx - cx, dz = ncz - cz;
-        if (dx*dx + dz*dz > DOOR_GROUP_RADIUS * DOOR_GROUP_RADIUS) continue;
+        /* the primary itself, or a leaf sharing its doorway */
+        if ((i32)i != best &&
+            !(elev_is_leaf(el) && doors_same_doorway(level, anx, axx, anz, axz, el)))
+            continue;
         int nk = INF_KEY_NONE;
         InfDoorResult r = inf_nudge_door(inf, el->sector_idx, have_keys, &nk);
         if (r == INF_DOOR_UNLOCKED) res = INF_DOOR_UNLOCKED;
@@ -856,7 +893,7 @@ static bool inf_point_in_sector(const LvtSector *s, f32 x, f32 z) {
     return (c & 1) != 0;
 }
 
-/* Nudge every door leaf clustered around sector `target` (double doors). */
+/* Nudge the door on sector `target` plus the other leaf of the same doorway. */
 static InfDoorResult inf_nudge_door_group(InfSystem *inf, const LvtLevel *level,
                                           u32 target, u32 have_keys,
                                           int *needed_key) {
@@ -864,24 +901,29 @@ static InfDoorResult inf_nudge_door_group(InfSystem *inf, const LvtLevel *level,
     /* Find a door elevator on `target` (or a flag-door whose stacked partner is
      * `target` — nudging the walk-through leaf opens its transom's door); if
      * none, nothing to group around. */
-    f32 tcx = 0, tcz = 0; bool have_c = false;
+    i32 tgt = -1;
     for (u32 i = 0; i < inf->count; i++) {
         Elevator *el = &inf->elevs[i];
         if (el->active && elev_is_door(el) &&
+            el->sector_idx < level->sector_count &&
             (el->sector_idx == target || el->stack_partner == (i32)target)) {
-            door_centroid(level, el, &tcx, &tcz); have_c = true; break;
+            tgt = (i32)i; break;
         }
     }
-    if (!have_c) return INF_DOOR_NONE;
+    if (tgt < 0) return INF_DOOR_NONE;
 
+    f32 anx, axx, anz, axz;
+    door_bbox(level, &inf->elevs[tgt], &anx, &axx, &anz, &axz);
     InfDoorResult res = INF_DOOR_NONE;
     for (u32 i = 0; i < inf->count; i++) {
         Elevator *el = &inf->elevs[i];
         if (!el->active || !elev_is_door(el)) continue;
         if (el->sector_idx >= level->sector_count) continue;
-        f32 cx, cz; door_centroid(level, el, &cx, &cz);
-        f32 dx = tcx - cx, dz = tcz - cz;
-        if (dx*dx + dz*dz > DOOR_GROUP_RADIUS * DOOR_GROUP_RADIUS) continue;
+        /* the target itself, or another leaf sharing its doorway (touching
+         * footprint) — NOT a separate doorway a few units away. */
+        if ((i32)i != tgt &&
+            !(elev_is_leaf(el) && doors_same_doorway(level, anx, axx, anz, axz, el)))
+            continue;
         int nk = INF_KEY_NONE;
         InfDoorResult r = inf_nudge_door(inf, el->sector_idx, have_keys, &nk);
         if (r == INF_DOOR_UNLOCKED) res = INF_DOOR_UNLOCKED;
@@ -1186,9 +1228,15 @@ static bool apply_morph(const Elevator *el, LvtSector *sec) {
     if (n > sec->vertex_count) n = sec->vertex_count;
 
     if (el->type == ELEV_TYPE_MORPH_MOVE) {
+        /* Jedi/Outlaws angle convention: 0°=+Z (north), 90°=+X (east), measured
+         * clockwise — so the travel direction is (sin, cos), NOT (cos, sin).
+         * (Matches Dark Forces' moving-wall math: delta.x=sin·d, delta.z=cos·d.)
+         * The old (cos,sin) rotated every slide 90°, so a door authored to slide
+         * left/right along its length instead crept along its thin axis — i.e.
+         * toward/away from the player (TRAIN's sliding doors "receding"). */
         f32 a  = el->angle_deg * (3.14159265f / 180.0f);
-        f32 dx = cosf(a) * delta;
-        f32 dz = sinf(a) * delta;
+        f32 dx = sinf(a) * delta;
+        f32 dz = cosf(a) * delta;
         for (u32 v = 0; v < n; v++) {
             sec->vertices[v].x = el->base_verts[v].x + dx;
             sec->vertices[v].y = el->base_verts[v].y + dz; /* Vec2.y = LVT Z */
@@ -1216,13 +1264,19 @@ void inf_update(InfSystem *inf, f32 dt, LvtLevel *level) {
         if (!el->active) continue;
         el->just_triggered = false; /* Reset each frame */
 
-        /* Scroll elevators: accumulate UV offset continuously, no geometry change */
+        /* Scroll elevators: accumulate UV offset continuously, no geometry change.
+         * Same Jedi/Outlaws angle convention as morph moves (0°=+Z, 90°=+X →
+         * dir=(sin,cos)); floor UV is u=worldX/64, v=worldZ/64. TRAIN's moving
+         * ground is SCROLL_FLOOR ANGLE 0 → it must scroll along Z (the train's
+         * length = forward), i.e. into V. The old (cos,sin) scrolled U (world X),
+         * so the floor crept sideways instead of rushing forward; SCROLL_WALL
+         * (ANGLE 90/270) likewise scrolled vertically instead of along the wall. */
         if (el->type == ELEV_TYPE_SCROLL_FLOOR ||
             el->type == ELEV_TYPE_SCROLL_WALL) {
             f32 a = el->angle_deg * (3.14159265f / 180.0f);
             f32 rate = 1.0f / 64.0f;
-            el->scroll_u += cosf(a) * el->speed * rate * dt;
-            el->scroll_v += sinf(a) * el->speed * rate * dt;
+            el->scroll_u += sinf(a) * el->speed * rate * dt;
+            el->scroll_v += cosf(a) * el->speed * rate * dt;
             continue;  /* No sector geometry modification */
         }
         /* VELOCITY_Z: advance through stops to cycle velocity value, no geometry change */
@@ -1274,7 +1328,11 @@ void inf_update(InfSystem *inf, f32 dt, LvtLevel *level) {
         f32 diff   = target - el->current_y;
         f32 step   = el->speed * dt;
 
-        if (fabsf(diff) <= step) {
+        /* SPEED 0 = instantaneous (a message-relay controller like TRAIN's
+         * LOADED*DUMMY: it snaps to the stop and fires its GOTO_STOP messages
+         * the same frame). Without this it never reaches the stop, so it stays
+         * `moving` forever and flags the mesh dirty every frame. */
+        if (step <= 0.0f || fabsf(diff) <= step) {
             /* Reached stop */
             el->current_y = target;
             el->current_stop = el->next_stop;
@@ -1410,6 +1468,15 @@ void inf_trigger(InfSystem *inf, u32 sector_idx) {
         Elevator *el = &inf->elevs[i];
         if (!el->active) continue;
         if (el->sector_idx != sector_idx) continue;
+        /* Doors are opened by the directional USE ray (inf_nudge_door_ray) and
+         * the short proximity fallback — NOT by this blanket per-sector trigger.
+         * Otherwise pressing USE inside a train vestibule (which adjoins several
+         * door sectors) advanced every one of them → "one door opens them all". */
+        if (elev_is_door(el)) continue;
+        /* An elevator with fewer than two stops has nowhere to step; stepping it
+         * would divide by zero (stop_count 0) — e.g. a stopless controller on the
+         * sector adjoining TRAIN's first-wagon back door (the reported crash). */
+        if (el->stop_count < 2) continue;
 
         if (!el->moving) {
             /* Advance to next stop */

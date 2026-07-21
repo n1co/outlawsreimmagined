@@ -24,6 +24,12 @@ static void boss_display_name(const char *type, char *out, int cap) {
     if (strncasecmp(type, "JAMES", 5) == 0)   { snprintf(out, cap, "JAMES ANDERSON"); return; }
     if (strncasecmp(type, "TWOFEATH", 8) == 0){ snprintf(out, cap, "TWO FEATHERS"); return; }
     if (strncasecmp(type, "MARY", 4) == 0)    { snprintf(out, cap, "BLOODY MARY"); return; }
+    if (strncasecmp(type, "EBOBGRAH", 8) == 0 || strncasecmp(type, "BOBGRAH", 7) == 0) {
+        snprintf(out, cap, "BOB GRAHAM"); return;
+    }
+    if (strncasecmp(type, "EBILLMOR", 8) == 0 || strncasecmp(type, "BILLMOR", 7) == 0) {
+        snprintf(out, cap, "BILL MORGAN"); return;
+    }
     snprintf(out, cap, "THE OUTLAW");
 }
 
@@ -32,16 +38,26 @@ void mission_init(MissionState *m, const EntityList *entities) {
     m->boss_idx = -1;
     snprintf(m->boss_name, sizeof(m->boss_name), "THE OUTLAW");
     i32 candidates = 0, active_boss_idx = -1;
+    char first_boss[32] = {0};
+    bool multiple_names = false;
     for (u32 i = 0; i < entities->count; i++) {
         const Entity *e = &entities->entities[i];
         if (e->is_boss) {
             candidates++;
-            boss_display_name(e->type_name, m->boss_name, sizeof(m->boss_name));
+            char nm[32];
+            boss_display_name(e->type_name, nm, sizeof(nm));
+            if (!first_boss[0]) snprintf(first_boss, sizeof(first_boss), "%s", nm);
+            else if (strcmp(first_boss, nm) != 0) multiple_names = true;
+            snprintf(m->boss_name, sizeof(m->boss_name), "%s", nm);
             if (e->active && active_boss_idx < 0) active_boss_idx = (i32)i;
         } else if (is_regular_enemy(e) && e->active) {
             m->total_enemies++;
         }
     }
+    /* Several distinct bosses in one level (e.g. RANCH: Bob Graham + Bill
+     * Morgan) → a collective objective rather than naming just one. */
+    if (multiple_names)
+        snprintf(m->boss_name, sizeof(m->boss_name), "THE GANG");
     m->has_boss = (candidates > 0);
     if (!m->has_boss) return;
 

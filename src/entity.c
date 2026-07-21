@@ -103,6 +103,14 @@ static const EntityDef s_defs[] = {
      * the difficulty variant first. Slim is HIDEOUT's boss (upstairs room). */
     { "ESLIM",        ENTITY_ENEMY,       12,  0,  7,  8, 130},
     { "SLIM",         ENTITY_ENEMY,       12,  0,  7,  8, 130},
+    /* RANCH's two gang bosses: Bob Graham (Bob_New) & Bill Morgan (Buckshot_New).
+     * Health from their ITMs (EBobGrah=16, EBillMor=8; base variants 18/14). E-
+     * variants first so the exact match wins before the base-name prefix. Sprites
+     * resolve via the ITM ANIM field (Bobgrahm.NWX / BillMorg.NWX). */
+    { "EBOBGRAH",     ENTITY_ENEMY,       16,  0,  7,  8, 140},
+    { "BOBGRAH",      ENTITY_ENEMY,       18,  0,  7,  8, 140},
+    { "EBILLMOR",     ENTITY_ENEMY,        8,  0,  7,  8, 140},
+    { "BILLMOR",      ENTITY_ENEMY,       14,  0,  7,  8, 140},
 
     /* Health pickups */
     { "GDOCBAG",      ENTITY_ITEM_HEALTH, 0,  50,  8,  8,   0},
@@ -245,7 +253,11 @@ int entity_add(EntityList *list, const ObtObject *obj) {
         e->is_boss = true;
         e->active  = false;   /* dormant until the mission triggers it */
     } else if (strncasecmp(obj->type, "SLIM", 4) == 0 ||
-               strncasecmp(obj->type, "ESLIM", 5) == 0) {
+               strncasecmp(obj->type, "ESLIM", 5) == 0 ||
+               strncasecmp(obj->type, "BOBGRAH", 7) == 0 ||
+               strncasecmp(obj->type, "EBOBGRAH", 8) == 0 ||
+               strncasecmp(obj->type, "BILLMOR", 7) == 0 ||
+               strncasecmp(obj->type, "EBILLMOR", 8) == 0) {
         e->is_boss = true;    /* active from the start (kept active below) */
     }
 

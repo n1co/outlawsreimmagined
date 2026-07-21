@@ -279,7 +279,7 @@ static bool parse_sector(Parser *p, LvtSector *sec) {
         }
         if (strcasecmp(tok, "FLAGS") == 0) {
             sec->flags = (u32)read_int(p);
-            read_int(p); /* second flags */
+            sec->flags2 = (u32)read_int(p);
             continue;
         }
         if (strcasecmp(tok, "LAYER") == 0) {

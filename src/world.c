@@ -489,36 +489,57 @@ static void upload_level_textures(const LvtLevel *level,
  * WAX sprite loading for entities
  * ---------------------------------------------------------------------- */
 
+/* Try to fetch <base>.WAX then <base>.NWX (case-insensitive, all archives). */
+static const u8 *fetch_wax_data(const Archives *arc, const char *base, u32 *sz) {
+    char n[80];
+    snprintf(n, sizeof(n), "%s.WAX", base);
+    const u8 *d = archives_get(arc, n, sz);
+    if (d) return d;
+    snprintf(n, sizeof(n), "%s.NWX", base);
+    return archives_get(arc, n, sz);
+}
+
 /*
  * Try to load WAX sprite data for an entity type.
  * Returns a decoded WaxSprite on success (caller must call wax_free).
- * Sets tex_base_name to the lowercase type name base (e.g. "bgy1.nwx").
+ * Sets tex_base to the lowercase sprite base name (e.g. "bgy1.nwx").
+ *
+ * Sprites are resolved <TYPE>.NWX first, but many actors (esp. the story
+ * bosses in the DLC levels) name their costume via the ITM's ANIM field
+ * instead — e.g. OBT type EBOBGRAH → EBobGrah.itm ANIM Bobgrahm.NWX. So when
+ * the direct lookup misses we parse <TYPE>.itm and retry with its ANIM name,
+ * which is how the original engine resolves an actor's costume.
  */
 static bool load_entity_wax(const char *type_name, const Archives *arc,
                              WaxSprite *sprite, char tex_base[64]) {
-    /* Build canonical texture base name */
-    snprintf(tex_base, 64, "%s.nwx", type_name);
-    for (char *p = tex_base; *p; p++) *p = tolower((unsigned char)*p);
-
-    /* Try <TYPE>.WAX then <TYPE>.NWX in olobj.lab */
-    char wax_name[64];
-    snprintf(wax_name, sizeof(wax_name), "%s.WAX", type_name);
+    char base[64];
+    snprintf(base, sizeof(base), "%s", type_name);
 
     u32 wsize = 0;
-    const u8 *wdata = lab_get(&arc->obj, wax_name, &wsize);
+    const u8 *wdata = fetch_wax_data(arc, base, &wsize);
+
     if (!wdata) {
-        for (char *p = wax_name; *p; p++) *p = tolower((unsigned char)*p);
-        wdata = lab_get(&arc->obj, wax_name, &wsize);
-    }
-    if (!wdata) {
-        snprintf(wax_name, sizeof(wax_name), "%s.NWX", type_name);
-        wdata = lab_get(&arc->obj, wax_name, &wsize);
-        if (!wdata) {
-            for (char *p = wax_name; *p; p++) *p = tolower((unsigned char)*p);
-            wdata = lab_get(&arc->obj, wax_name, &wsize);
+        /* Resolve the costume via the type's ITM ANIM field. */
+        char itm_name[80];
+        snprintf(itm_name, sizeof(itm_name), "%s.itm", type_name);
+        u32 isz = 0;
+        const u8 *idata = archives_get(arc, itm_name, &isz);
+        if (idata && isz) {
+            ItmFile itm;
+            if (itm_parse(&itm, (const char *)idata, isz) &&
+                itm.anim[0] && strcasecmp(itm.anim, "NULL") != 0) {
+                snprintf(base, sizeof(base), "%s", itm.anim);
+                char *dot = strrchr(base, '.');   /* strip .nwx/.wax */
+                if (dot) *dot = '\0';
+                wdata = fetch_wax_data(arc, base, &wsize);
+            }
         }
     }
     if (!wdata) return false;
+
+    /* tex_base = lowercase resolved sprite base + .nwx (texture-cache prefix). */
+    snprintf(tex_base, 64, "%s.nwx", base);
+    for (char *p = tex_base; *p; p++) *p = tolower((unsigned char)*p);
 
     return wax_decode(sprite, wdata, wsize, arc->palette);
 }
@@ -1017,6 +1038,27 @@ bool world_load(World *world, Archives *arc,
              * the surface is the ceiling, the floor is the real ground bottom. */
             sec->water_at_ceiling = (cw && !fw);
         }
+    }
+
+    /* Light-inherit sectors: Outlaws marks door / moving-panel sectors with
+     * sector flags2 bit 0x80000000 and authors their AMBIENT as 0 (a sentinel,
+     * not "black") — they take their light from the sector they open into. All
+     * 69 TRAIN door sectors are like this; rendering them at 0 made the sliding
+     * doors pitch-black. Inherit the brightest adjoining sector's ambient. */
+    for (u32 s = 0; s < world->lvt.sector_count; s++) {
+        LvtSector *sec = &world->lvt.sectors[s];
+        if (!(sec->flags2 & 0x80000000u) || sec->ambient != 0) continue;
+        i32 best = 0;
+        for (u32 w = 0; w < sec->wall_count; w++) {
+            i32 aj = sec->walls[w].adjoin;
+            if (aj < 0 || (u32)aj >= world->lvt.sector_count) continue;
+            const LvtSector *a = &world->lvt.sectors[aj];
+            /* Skip other light-inherit neighbours (also 0) so a door between two
+             * doors still picks up the real room behind them. */
+            if ((a->flags2 & 0x80000000u) && a->ambient == 0) continue;
+            if (a->ambient > best) best = a->ambient;
+        }
+        if (best > 0) sec->ambient = best;
     }
 
     /* Build the working palette for this level.

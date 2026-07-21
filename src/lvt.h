@@ -106,6 +106,9 @@ typedef struct {
 
     /* Sector flags */
     u32  flags;
+    u32  flags2;       /* Second flag word. Bit 0x80000000 marks a "light-inherit"
+                        * sector (doors/moving panels authored with AMBIENT 0 that
+                        * take their light from the sector they open into). */
     i32  layer;
 
     /* Sloped geometry (SLOPEDFLOOR / SLOPEDCEILING) */
