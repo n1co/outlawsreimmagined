@@ -64,6 +64,8 @@ typedef struct {
     float eye_height;
     float sector_floor;        /* current sector floor/ceil at player */
     float sector_ceil;
+    int   in_water;            /* 1 = player's sector is a water/swim sector */
+    char  sector_floor_tex[32];/* floor texture name of the player's sector */
 
     /* Weapon (read-only) */
     int   weapon_idx;

@@ -993,6 +993,32 @@ bool world_load(World *world, Archives *arc,
     /* Copy music filename from LVT header */
     snprintf(world->music_file, sizeof(world->music_file), "%s", world->lvt.music_file);
 
+    /* Flag water sectors: their floor texture is a liquid (WATER/LIQUID). The
+     * player swims in these instead of standing on the surface. */
+    for (u32 s = 0; s < world->lvt.sector_count; s++) {
+        LvtSector *sec = &world->lvt.sectors[s];
+        sec->is_water = false;
+        sec->water_at_ceiling = false;
+        #define TEX_IS_WATER(idx) ({                                           \
+            bool _w = false;                                                   \
+            if ((idx) >= 0 && (u32)(idx) < world->lvt.texture_count) {         \
+                char _up[LVT_MAX_NAME]; const char *_tn = world->lvt.textures[idx]; \
+                int _i = 0; for (; _tn[_i] && _i < LVT_MAX_NAME-1; _i++)       \
+                    _up[_i] = (char)toupper((unsigned char)_tn[_i]);           \
+                _up[_i] = '\0';                                                \
+                _w = strstr(_up, "WATER") || strstr(_up, "LIQUID");           \
+            } _w; })
+        bool fw = TEX_IS_WATER(sec->floor_tex);
+        bool cw = TEX_IS_WATER(sec->ceil_tex);
+        #undef TEX_IS_WATER
+        if (fw || cw) {
+            sec->is_water = true;
+            /* Water on the ceiling (and not the floor) = the underwater half:
+             * the surface is the ceiling, the floor is the real ground bottom. */
+            sec->water_at_ceiling = (cw && !fw);
+        }
+    }
+
     /* Build the working palette for this level.
      *
      * Original engine (Ghidra-confirmed):

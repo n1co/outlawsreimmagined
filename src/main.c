@@ -109,6 +109,7 @@ typedef struct {
 
     /* Landing detection for LAND.WAV */
     bool  was_airborne;
+    bool  in_water_prev;   /* was the player swimming last frame (splash on entry) */
 
     /* Previous weapon for switch-sound detection */
     WeaponType prev_weapon;
@@ -2313,6 +2314,57 @@ static void app_run(void) {
             pl->max_eye = OL_MIN(PLAYER_BODY_HEIGHT, ceil_y - floor_y)
                           - PLAYER_HEAD_HEIGHT;
 
+            bool in_water = (pl->sector_idx >= 0 &&
+                             pl->sector_idx < (i32)g_app.world.lvt.sector_count &&
+                             g_app.world.lvt.sectors[pl->sector_idx].is_water);
+
+            if (in_water) {
+                /* ---- Swimming (Jedi 2-sector water) ----
+                 * The water surface is the water-textured side of the sector:
+                 * the CEILING in the underwater half (real ground floor below),
+                 * else the FLOOR (surface half). The player floats with the eyes
+                 * at the surface and swims up/down with Space/Ctrl; buoyancy eases
+                 * toward the float level, water damps motion, gravity + fall
+                 * damage are suspended. */
+                const LvtSector *wsec = &g_app.world.lvt.sectors[pl->sector_idx];
+                bool underwater = wsec->water_at_ceiling;
+                f32 surface = underwater ? ceil_y : floor_y;
+                f32 bottom  = underwater ? floor_y : (surface - PHY_SWIM_DEPTH);
+                if (!g_app.in_water_prev) {   /* entered water: splash, kill fall */
+                    if (g_app.sfx_water) audio_play(&g_app.audio, g_app.sfx_water);
+                    pl->fall_peak = 0.0f; pl->vel_y = 0.0f;
+                }
+                /* Idle float level: feet so the eyes sit at the waterline (but
+                 * never below the ground in shallow water). */
+                f32 float_feet = surface - pl->eye_height + 1.0f;
+                if (float_feet < bottom) float_feet = bottom;
+                bool sw_up = input_key_held(&g_app.input, SDL_SCANCODE_SPACE);
+                bool sw_dn = input_key_held(&g_app.input, SDL_SCANCODE_LCTRL) ||
+                             input_key_held(&g_app.input, SDL_SCANCODE_RCTRL) ||
+                             input_key_held(&g_app.input, SDL_SCANCODE_C) ||
+                             pl->crouching;   /* crouch key = dive */
+                if (sw_dn) {
+                    pl->vel_y = -PHY_SWIM_VERT;                 /* dive */
+                } else if (sw_up) {
+                    pl->vel_y = PHY_SWIM_VERT;                  /* swim up (hold) */
+                } else {
+                    /* Buoyancy: ease to the treading float level (never sinks on
+                     * its own, never overshoots). */
+                    f32 d = float_feet - pl->pos.y;
+                    pl->vel_y = OL_CLAMP(d * 5.0f, -PHY_SWIM_VERT, PHY_SWIM_VERT);
+                }
+                pl->pos.y += pl->vel_y * dt;
+                /* Surface cap: can't swim up into the air above the water. */
+                if (pl->pos.y > surface) { pl->pos.y = surface; if (pl->vel_y > 0) pl->vel_y = 0; }
+                /* Ground bottom: can't sink through the floor. */
+                if (pl->pos.y < bottom)  { pl->pos.y = bottom;  if (pl->vel_y < 0) pl->vel_y = 0; }
+                /* Water drag on horizontal motion (slower swimming). */
+                pl->vel.x -= pl->vel.x * PHY_SWIM_DAMP * dt;
+                pl->vel.z -= pl->vel.z * PHY_SWIM_DAMP * dt;
+                pl->on_ground = false;
+                pl->want_jump = false;
+                g_app.was_airborne = false;
+            } else {
             /* Vertical physics (Physics_ApplyGravityStep @0x4e05e0): gravity
              * applies only when the feet are more than STEP_HEIGHT above the
              * floor or already moving vertically; within the band the player
@@ -2357,6 +2409,8 @@ static void app_run(void) {
                 pl->pos.y = ceil_y - col_h;
                 if (pl->vel_y > 0) pl->vel_y = 0;
             }
+            }  /* end land/water branch */
+            g_app.in_water_prev = in_water;
 
             /* Jump (@0x444214): grounded && vy==0; impulse JUMP_VEL ×
              * (1 + (intent-1)·energy%) — 20 walk, 30 running. */
@@ -2383,6 +2437,26 @@ static void app_run(void) {
                     break;
                 }
             }
+        } else {
+            /* ---- Noclip free-fly ---- */
+            Player *pl = &g_app.player;
+            /* Horizontal movement already integrated by player_update. Add free
+             * vertical control: Space rises, Ctrl/C descends. Look direction is
+             * ignored so up/down are absolute (like the original debug fly). */
+            f32 fly = PHY_MAX_VEL * (pl->running ? 2.0f : 1.0f) * dt;
+            if (input_key_held(&g_app.input, SDL_SCANCODE_SPACE))
+                pl->pos.y += fly;
+            if (input_key_held(&g_app.input, SDL_SCANCODE_LCTRL) ||
+                input_key_held(&g_app.input, SDL_SCANCODE_RCTRL) ||
+                input_key_held(&g_app.input, SDL_SCANCODE_C))
+                pl->pos.y -= fly;
+            pl->vel_y = 0.0f;
+            pl->on_ground = false;
+            pl->want_jump = false;
+            g_app.was_airborne = false;
+            /* Track which sector we're flying through so rendering/look work. */
+            i32 s = collision_find_sector(&g_app.world.lvt, pl->pos.x, pl->pos.z, pl->pos.y);
+            if (s >= 0) pl->sector_idx = s;
         } /* end noclip check */
         } /* end collision block */
 
@@ -2876,6 +2950,17 @@ render_frame:
                 collision_heights(&g_app.world.lvt, g_app.player.sector_idx,
                                   g_app.player.pos.x, g_app.player.pos.z, &fy, &cy2);
                 g_debug.sector_floor = fy; g_debug.sector_ceil = cy2;
+            }
+            /* Water / swim state of the player's current sector. */
+            g_debug.in_water = 0;
+            g_debug.sector_floor_tex[0] = '\0';
+            if (g_app.player.sector_idx >= 0 &&
+                g_app.player.sector_idx < (i32)g_app.world.lvt.sector_count) {
+                const LvtSector *ps = &g_app.world.lvt.sectors[g_app.player.sector_idx];
+                g_debug.in_water = ps->is_water ? 1 : 0;
+                if (ps->floor_tex >= 0 && (u32)ps->floor_tex < g_app.world.lvt.texture_count)
+                    snprintf(g_debug.sector_floor_tex, sizeof(g_debug.sector_floor_tex),
+                             "%s", g_app.world.lvt.textures[ps->floor_tex]);
             }
             debug_compute_lookat();
 

@@ -129,6 +129,15 @@ typedef struct {
      * door_slide is the 0..1 open amount (for the sliding-panel animation). */
     bool is_flag_door;
     f32  door_slide;
+
+    /* Water sector (Jedi 2-sector scheme): a floor OR ceiling water texture
+     * (e.g. GAWATER1) marks a swimmable sector. Above-water sectors carry the
+     * water on the FLOOR (surface seen from above); the underwater sector below
+     * (VADJOIN-linked) carries it on the CEILING (surface seen from below) with
+     * a real ground floor. The player swims in both. water_at_ceiling = true for
+     * the underwater half (surface = ceil_y); otherwise surface = floor_y. */
+    bool is_water;
+    bool water_at_ceiling;
 } LvtSector;
 
 /* Complete parsed level */

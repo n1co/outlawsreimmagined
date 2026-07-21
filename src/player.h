@@ -54,6 +54,16 @@
 #define PLAYER_MOUSE_SENS       0.002f /* radians/pixel */
 
 /* Energy/stamina (player ITM: E_REST +4/s, E_MOVE -4/s, E_JUMP -5) */
+/* Swimming (water sectors). The player floats submerged with the eyes near the
+ * surface and swims up/down with Space/Ctrl; water damps motion and cancels
+ * gravity + fall damage. Reconstruction (the retail physics tick was too large
+ * to decompile) — tune to taste. */
+#define PHY_SWIM_SPEED_MULT     0.6f   /* horizontal speed while swimming */
+#define PHY_SWIM_VERT          14.0f   /* up/down swim speed (u/s) */
+#define PHY_SWIM_BUOY          18.0f   /* buoyancy pull toward the float level */
+#define PHY_SWIM_DAMP           5.0f   /* water drag on vertical velocity /s */
+#define PHY_SWIM_DEPTH         48.0f   /* max dive below the surface */
+
 #define PHY_E_REST              4.0f
 #define PHY_E_MOVE             -4.0f
 #define PHY_E_JUMP             -5.0f

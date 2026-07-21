@@ -132,6 +132,9 @@ void debug_ui_render(void) {
                     g_debug.eye_height,
                     g_debug.on_ground ? "grounded" : "AIRBORNE",
                     g_debug.crouching ? "CROUCH" : "stand");
+        ImGui::Text("Floor tex: %s   %s",
+                    g_debug.sector_floor_tex[0] ? g_debug.sector_floor_tex : "-",
+                    g_debug.in_water ? "[WATER/SWIM]" : "");
         ImGui::Separator();
         int hp = g_debug.player_health;
         ImVec4 hc = hp > 50 ? ImVec4(0.4f,1,0.4f,1)
