@@ -44,7 +44,16 @@ void debug_ui_shutdown(void) {
 }
 
 void debug_ui_process_event(SDL_Event *event) {
-    ImGui_ImplSDL2_ProcessEvent(event);
+    /* Only feed events to ImGui while the overlay is visible. The SDL2 backend
+     * QUEUES every event (esp. mouse-motion) into ImGuiIO, but that queue is only
+     * drained by ImGui::NewFrame — which we call solely when visible. If we fed
+     * events while hidden, minutes of gameplay mouse-look would pile up thousands
+     * of queued moves; on open, ImGui replays them one position-change per frame
+     * (to never merge a move with a click), so the panels show a long stream of
+     * hover animations and stay unresponsive until the backlog drains. Gating the
+     * feed keeps the queue empty while hidden, so the UI is instant on open. */
+    if (g_debug.visible)
+        ImGui_ImplSDL2_ProcessEvent(event);
 
     /* INSERT (and F1) toggles debug UI */
     if (event->type == SDL_KEYDOWN &&

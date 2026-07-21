@@ -1522,7 +1522,7 @@ static bool app_init(int argc, char **argv) {
 
     g_app.running = true;
     OL_LOG("Ready. Click window to capture mouse, Esc to release/quit.\n");
-    OL_LOG("WASD: move  Mouse: look  LMB: fire  1-9: weapon  F5: reload\n");
+    OL_LOG("WASD: move  Mouse: look  LMB: fire  1-9: weapon  hold R: reload  F5: reload level\n");
     return true;
 }
 
@@ -2540,9 +2540,13 @@ static void app_run(void) {
         if (!g_app.player.dead) {
             WeaponState *ws = &g_app.player.weapons;
             const WeaponDef *wdef = &g_weapon_defs[ws->current];
-            bool lmb_held  = g_app.input.mouse_buttons[0] ||
-                             (g_app.screenshot_firing && g_app.screenshot_frames > 0);
-            bool rmb_held  = g_app.input.mouse_buttons[2];
+            /* Debug overlay open → clicks belong to ImGui, not the gun. Treat the
+             * mouse as unpressed (but still update lmb/rmb_prev below) so closing
+             * the menu with a button held doesn't fire a phantom shot. */
+            bool ui_open  = g_debug.visible;
+            bool lmb_held  = !ui_open && (g_app.input.mouse_buttons[0] ||
+                             (g_app.screenshot_firing && g_app.screenshot_frames > 0));
+            bool rmb_held  = !ui_open && g_app.input.mouse_buttons[2];
             bool lmb_press = lmb_held && !g_app.lmb_prev;
             bool rmb_press = rmb_held && !g_app.rmb_prev;
             g_app.lmb_prev = lmb_held;
@@ -2578,7 +2582,7 @@ static void app_run(void) {
             }
 
             /* Rifle scope toggle (V): no aim error, full-range traces, zoom. */
-            if (input_key_pressed(&g_app.input, SDL_SCANCODE_V) && wdef->has_scope) {
+            if (!ui_open && input_key_pressed(&g_app.input, SDL_SCANCODE_V) && wdef->has_scope) {
                 ws->scope_active = !ws->scope_active;
                 renderer_set_zoom(&g_app.renderer, ws->scope_active ? 2.0f : 1.0f);
             }
@@ -2590,7 +2594,7 @@ static void app_run(void) {
         /* (Reload is driven by the reload_held flag set before player_update —
          * hold R to chamber rounds one at a time; see above.) */
         /* Automap overlay toggle (TAB) */
-        if (input_key_pressed(&g_app.input, SDL_SCANCODE_TAB))
+        if (!g_debug.visible && input_key_pressed(&g_app.input, SDL_SCANCODE_TAB))
             g_app.show_map = !g_app.show_map;
         /* Advance fire animation */
         if (g_app.player.fire_anim) {
