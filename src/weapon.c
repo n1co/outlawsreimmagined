@@ -234,26 +234,30 @@ void weapon_update(WeaponState *ws, f32 dt) {
     if (ws->fire_cooldown > 0.0f)
         ws->fire_cooldown -= dt;
 
-    /* Per-round reload: one round per RELOAD_CHOR loop; fire interrupts
-     * after the current round finishes loading (@0x4709e0). */
-    if (ws->reloading) {
-        ws->reload_timer -= dt;
-        if (ws->reload_timer <= 0.0f) {
-            WeaponType cur = ws->current;
-            const WeaponDef *def = &g_weapon_defs[cur];
-            if (def->clip_size > 0 && ws->clip[cur] < def->clip_size &&
-                ws->ammo[cur] > 0) {
+    /* Per-round reload (Weapon_ReloadStep @0x4709e0): while the reload key is
+     * HELD, the RELOAD_CHOR loops and loads ONE round per loop; releasing the
+     * key stops it after the current round (so you can chamber a single round
+     * and fire it). Firing also interrupts. */
+    ws->reload_click = false;
+    {
+        WeaponType cur = ws->current;
+        const WeaponDef *def = &g_weapon_defs[cur];
+        bool can_reload = !def->melee && def->clip_size > 0 && !def->auto_reload &&
+                          ws->clip[cur] < def->clip_size && ws->ammo[cur] > 0;
+        if (ws->reload_held && can_reload && !ws->reload_interrupt &&
+            ws->fire_cooldown <= 0.0f) {
+            if (!ws->reloading) { ws->reloading = true; ws->reload_timer = reload_step_time; }
+            ws->reload_timer -= dt;
+            if (ws->reload_timer <= 0.0f) {
                 ws->clip[cur]++;
                 ws->ammo[cur]--;
+                ws->reload_click = true;              /* → play RELOAD_SOUND */
+                ws->reload_timer = reload_step_time;  /* next round if still held */
             }
-            bool full  = (ws->clip[ws->current] >= def->clip_size);
-            bool empty = (ws->ammo[ws->current] <= 0);
-            if (full || empty || ws->reload_interrupt) {
-                ws->reloading = false;
-                ws->reload_interrupt = false;
-            } else {
-                ws->reload_timer = reload_step_time;
-            }
+        } else {
+            /* Key released, clip full, out of reserve, or fire pressed → stop. */
+            ws->reloading = false;
+            ws->reload_interrupt = false;
         }
     }
 

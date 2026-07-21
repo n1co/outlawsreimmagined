@@ -2202,7 +2202,15 @@ static void app_run(void) {
         if (g_app.player.sector_idx >= 0 &&
             g_app.player.sector_idx < (i32)g_app.world.lvt.sector_count)
             sec_friction = g_app.world.lvt.sectors[g_app.player.sector_idx].friction;
+        /* Reload while R is HELD (bullet-by-bullet, faithful): weapon_update runs
+         * inside player_update and loads one round per RELOAD_CHOR loop while
+         * reload_held is set; releasing R stops it. */
+        g_app.player.weapons.reload_held = input_key_held(game_input, SDL_SCANCODE_R);
         bool fired = player_update(&g_app.player, game_input, dt, sec_friction);
+        /* Per-round reload sound (each chambered round). */
+        if (g_app.player.weapons.reload_click &&
+            g_app.sfx_reload_w[g_app.player.weapons.current])
+            audio_play(&g_app.audio, g_app.sfx_reload_w[g_app.player.weapons.current]);
         if (g_app.force_crouch) { /* debug: force the crouch eye height */
             g_app.player.crouching = true;
             g_app.player.eye_height = PLAYER_CROUCH_EYE;
@@ -2463,7 +2471,8 @@ static void app_run(void) {
         /* ---- Item pickup (dispatch by kind: heal / ammo / weapon / key) ---- */
         {
             PickupResult pk = entity_try_pickup_ex(&g_app.world.entities,
-                                                   g_app.player.pos);
+                                                   g_app.player.pos,
+                                                   g_app.player.health, PLAYER_MAX_HEALTH);
             if (pk.got) {
                 audio_play(&g_app.audio, g_app.sfx_pickup);
                 switch (pk.kind) {
@@ -2485,13 +2494,17 @@ static void app_run(void) {
                     break;
                 }
                 case ENTITY_ITEM_WEAPON: {
-                    WeaponType w = WEAPON_SHOTGUN;
-                    const char *t = pk.type_name;
-                    if      (strncasecmp(t, "GSAWGUN", 7) == 0) w = WEAPON_SAW_GUN;
-                    else if (strncasecmp(t, "GSCOPE",  6) == 0) w = WEAPON_RIFLE;
-                    else if (strncasecmp(t, "GSGUN",   5) == 0) w = WEAPON_SHOTGUN;
-                    else                                        w = WEAPON_SHOTGUN;
-                    weapon_pickup(&g_app.player.weapons, w, 20);
+                    /* pk.value carries the WeaponType index (entity s_defs). */
+                    WeaponType w = (pk.value > 0 && pk.value < WEAPON_COUNT)
+                                       ? (WeaponType)pk.value : WEAPON_SHOTGUN;
+                    bool had = g_app.player.weapons.has_weapon[w];
+                    /* Ground weapon grants the gun + one clip of reserve ammo. */
+                    i32 give = g_weapon_defs[w].clip_size;
+                    if (give <= 0) give = 6;
+                    weapon_pickup(&g_app.player.weapons, w, give);
+                    /* Auto-switch only to a NEWLY acquired gun (a duplicate just
+                     * tops up ammo, like the original). */
+                    if (!had) weapon_switch(&g_app.player.weapons, w);
                     break;
                 }
                 case ENTITY_ITEM_KEY: {
@@ -2574,14 +2587,8 @@ static void app_run(void) {
                 renderer_set_zoom(&g_app.renderer, 1.0f);
             }
         }
-        /* Manual reload (R key): per-round, with the weapon's reload sound */
-        if (input_key_pressed(&g_app.input, SDL_SCANCODE_R)) {
-            WeaponState *ws = &g_app.player.weapons;
-            bool was = ws->reloading;
-            weapon_reload(ws);
-            if (!was && ws->reloading && g_app.sfx_reload_w[ws->current])
-                audio_play(&g_app.audio, g_app.sfx_reload_w[ws->current]);
-        }
+        /* (Reload is driven by the reload_held flag set before player_update —
+         * hold R to chamber rounds one at a time; see above.) */
         /* Automap overlay toggle (TAB) */
         if (input_key_pressed(&g_app.input, SDL_SCANCODE_TAB))
             g_app.show_map = !g_app.show_map;

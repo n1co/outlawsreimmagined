@@ -28,13 +28,36 @@ static bool entity_point_in_sector(const LvtSector *sec, f32 x, f32 z) {
     return (crossings & 1) != 0;
 }
 
-static f32 entity_floor_at(const LvtLevel *lvt, f32 x, f32 z) {
+/* Y-aware floor lookup: among the (possibly stacked) sectors containing (x,z),
+ * pick the one whose [floor,ceil] span contains the reference Y `refy`; failing
+ * that, the sector whose floor is the closest at or below refy. Falls back to
+ * the first 2D match. Without this a building's stacked sectors (a room under a
+ * roof) resolve to the FIRST match — often the roof — so enemies snap to the
+ * rooftop instead of the floor they were placed on. */
+static f32 entity_floor_at_y(const LvtLevel *lvt, f32 x, f32 z, f32 refy) {
     if (!lvt) return 0.0f;
+    f32 best = 0.0f; bool found = false;
+    f32 best_below = -1e30f; bool below = false;
+    f32 first = 0.0f; bool have_first = false;
     for (u32 si = 0; si < lvt->sector_count; si++) {
-        if (entity_point_in_sector(&lvt->sectors[si], x, z))
-            return lvt->sectors[si].floor_y;
+        const LvtSector *s = &lvt->sectors[si];
+        if (!entity_point_in_sector(s, x, z)) continue;
+        if (!have_first) { first = s->floor_y; have_first = true; }
+        /* refy inside this sector's vertical span → this is the level we're on */
+        if (refy >= s->floor_y - 4.0f && refy <= s->ceil_y + 0.5f) {
+            if (!found || fabsf(s->floor_y - refy) < fabsf(best - refy)) {
+                best = s->floor_y; found = true;
+            }
+        }
+        /* else track the highest floor at/below refy */
+        if (s->floor_y <= refy + 0.5f && s->floor_y > best_below) {
+            best_below = s->floor_y; below = true;
+        }
     }
-    return 0.0f;
+    if (found)      return best;
+    if (below)      return best_below;
+    if (have_first) return first;
+    return refy;
 }
 
 /* -------------------------------------------------------------------------
@@ -86,10 +109,18 @@ static const EntityDef s_defs[] = {
     { "GELIXIR",      ENTITY_ITEM_HEALTH, 0,  25,  6,  8,   0},
     { "GCANTEEN",     ENTITY_ITEM_HEALTH, 0,  20,  6,  8,   0},
 
-    /* Weapon pickups */
-    { "GSGUN",        ENTITY_ITEM_WEAPON, 0,   1,  8,  8,   0},
-    { "GSAWGUN",      ENTITY_ITEM_WEAPON, 0,   2,  8,  8,   0},
-    { "GSCOPE",       ENTITY_ITEM_WEAPON, 0,   3,  8,  8,   0},
+    /* Weapon pickups (OBT ground-item names = each weapon ITM's GROUND_ITEM
+     * field: gpistol/grifle/gsgun/gsawgun/gdbsgun/gknife/ggatgun). The base
+     * game scatters GPISTOL/GRIFLE/GKNIFE too — they MUST be pickable, not
+     * treated as decoration. The pickup_value carries the WeaponType index. */
+    { "GPISTOL",      ENTITY_ITEM_WEAPON, 0,   1,  8,  8,   0},  /* WEAPON_PISTOL */
+    { "GRIFLE",       ENTITY_ITEM_WEAPON, 0,   2,  8,  8,   0},  /* WEAPON_RIFLE */
+    { "GSCOPE",       ENTITY_ITEM_WEAPON, 0,   2,  8,  8,   0},  /* scoped rifle */
+    { "GSAWGUN",      ENTITY_ITEM_WEAPON, 0,   5,  8,  8,   0},  /* WEAPON_SAW_GUN */
+    { "GDBSGUN",      ENTITY_ITEM_WEAPON, 0,   4,  8,  8,   0},  /* WEAPON_DBL_SHOTGUN */
+    { "GSGUN",        ENTITY_ITEM_WEAPON, 0,   3,  8,  8,   0},  /* WEAPON_SHOTGUN */
+    { "GGATGUN",      ENTITY_ITEM_WEAPON, 0,   8,  8,  8,   0},  /* WEAPON_GATLING */
+    { "GKNIFE",       ENTITY_ITEM_WEAPON, 0,   7,  8,  8,   0},  /* WEAPON_KNIFE */
 
     /* Ammo/supply pickups */
     { "GDYNAM",       ENTITY_ITEM_AMMO,   0,   5,  6,  6,   0},
@@ -417,10 +448,11 @@ void entity_update_all(EntityList *list, Vec3 player_pos, f32 dt,
         if (!e->active) continue;
         if (e->kind == ENTITY_ENEMY) {
             update_enemy(e, player_pos, dt, lvt, player_hurt_cb);
-            /* Snap enemy Y to floor of the sector they occupy */
+            /* Snap enemy Y to the floor of the sector they occupy — Y-aware so a
+             * building's stacked sectors resolve to the level the enemy is on
+             * (their OBT spawn height), not the first 2D match (often the roof). */
             if (e->ai_state != AI_DEAD && lvt) {
-                f32 floor_y = entity_floor_at(lvt, e->pos.x, e->pos.z);
-                e->pos.y = floor_y;
+                e->pos.y = entity_floor_at_y(lvt, e->pos.x, e->pos.z, e->pos.y);
             }
             /* Drive per-AI-state animation (runs for all states incl. dead) */
             update_enemy_animation(e, dt);
@@ -534,11 +566,13 @@ int entity_nudge(EntityList *list, Vec3 origin, Vec3 dir, f32 reach) {
  * Item pickup
  * ---------------------------------------------------------------------- */
 i32 entity_try_pickup(EntityList *list, Vec3 player_pos) {
-    PickupResult r = entity_try_pickup_ex(list, player_pos);
+    /* Legacy helper: no health-cap gate (max_hp huge so health always picks up). */
+    PickupResult r = entity_try_pickup_ex(list, player_pos, 0, 0x7fffffff);
     return r.got ? r.value : 0;
 }
 
-PickupResult entity_try_pickup_ex(EntityList *list, Vec3 player_pos) {
+PickupResult entity_try_pickup_ex(EntityList *list, Vec3 player_pos,
+                                  i32 hp, i32 max_hp) {
     PickupResult r = {0};
     const f32 PICKUP_RANGE = 12.0f;
     for (u32 i = 0; i < list->count; i++) {
@@ -548,6 +582,8 @@ PickupResult entity_try_pickup_ex(EntityList *list, Vec3 player_pos) {
             e->kind != ENTITY_ITEM_AMMO &&
             e->kind != ENTITY_ITEM_KEY &&
             e->kind != ENTITY_ITEM_WEAPON) continue;
+        /* Don't consume a health pickup when already at full health. */
+        if (e->kind == ENTITY_ITEM_HEALTH && hp >= max_hp) continue;
         if (vec3_dist(e->pos, player_pos) < PICKUP_RANGE) {
             e->active = false;
             r.got   = true;
@@ -651,8 +687,20 @@ bool entity_damage(EntityList *list, int idx, i32 amount) {
         /* After that, deactivate (handled in update, but simple: just mark) */
         return true;
     }
+    /* Non-fatal hit: play the full HIT flinch (chor 1). Hold the pain state for
+     * the WHOLE hit-chor duration (frame_count × dt_ms) so every flinch frame is
+     * seen — a fixed 0.3s cut the 4-frame/800ms reaction off after one frame,
+     * which read as "no hit animation". Restart the flinch from frame 0 on each
+     * new hit so rapid fire keeps staggering the enemy. */
     e->ai_state = AI_PAIN;
-    e->ai_timer = 0.3f;
-    if (e->ai_state == AI_IDLE) e->ai_state = AI_ATTACK;
+    f32 pain_dur = 0.3f;
+    const EntityAnimSeq *ps = &e->anim_seqs[ANIM_PAIN];
+    if (ps->frame_count > 0 && ps->dt_ms > 0)
+        pain_dur = (f32)ps->frame_count * (f32)ps->dt_ms / 1000.0f;
+    e->ai_timer = pain_dur;
+    e->cur_anim = ANIM_PAIN;
+    e->cur_anim_frame = 0;
+    e->cur_anim_timer = 0.0f;
+    e->anim_loop = false;
     return false;
 }

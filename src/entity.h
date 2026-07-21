@@ -232,8 +232,11 @@ typedef struct {
  * Like entity_try_pickup but reports the picked item's kind and OBT type name
  * so the caller can apply the correct effect (health, ammo type, weapon, key).
  * Deactivates the entity on pickup. Returns got=false if nothing was near.
+ * Health pickups are SKIPPED (left on the ground) when hp >= max_hp — the
+ * original doesn't consume a medkit you can't use.
  */
-PickupResult entity_try_pickup_ex(EntityList *list, Vec3 player_pos);
+PickupResult entity_try_pickup_ex(EntityList *list, Vec3 player_pos,
+                                  i32 hp, i32 max_hp);
 
 /*
  * Cast a ray from origin in direction dir.

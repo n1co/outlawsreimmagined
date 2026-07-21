@@ -135,11 +135,14 @@ typedef struct {
     f32         fire_cooldown;           /* Time until next shot */
     bool        has_weapon[WEAPON_COUNT];
 
-    /* Per-round reload (Weapon_ReloadStep @0x4709e0): the RELOAD_CHOR loops,
-     * adding ONE round per loop; interruptible by pressing fire. */
+    /* Per-round reload (Weapon_ReloadStep @0x4709e0): the RELOAD_CHOR loops
+     * while the reload key is HELD, adding ONE round per loop; releasing the key
+     * stops it (so you can load a single round and fire it). Fire also stops it. */
     bool        reloading;
-    f32         reload_timer;            /* Time until next round loads */
+    f32         reload_timer;            /* Time until the next round loads */
     bool        reload_interrupt;        /* Fire pressed during reload */
+    bool        reload_held;             /* Reload key held this frame (set by main) */
+    bool        reload_click;            /* A round just loaded this frame (for sfx) */
 
     /* Cook state (knife LMB / TNT LMB wind-up): power = clamp(held, .5, 1) */
     bool        cooking;
