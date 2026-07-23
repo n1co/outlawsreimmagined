@@ -46,6 +46,9 @@
 /* Respawn delay (seconds) */
 #define RESPAWN_DELAY   3.0f
 
+/* Window shatter animation length (~6 break frames @ ~12fps + margin). */
+#define WINDOW_BREAK_DURATION 0.6f
+
 /* -------------------------------------------------------------------------
  * Application state
  * ---------------------------------------------------------------------- */
@@ -111,6 +114,7 @@ typedef struct {
     /* Landing detection for LAND.WAV */
     bool  was_airborne;
     bool  in_water_prev;   /* was the player swimming last frame (splash on entry) */
+    f32   window_anim_timer; /* >0 while a shot window plays its shatter frames */
 
     /* Previous weapon for switch-sound detection */
     WeaponType prev_weapon;
@@ -1651,9 +1655,11 @@ static bool break_glass_windows(Vec3 eye, Vec3 dir) {
     }
 
     if (!best) return false;
-    best->window_broken = true;
-    if (best_mirror) best_mirror->window_broken = true;
+    best->window_broken = true;  best->break_time = 0.0f;
+    if (best_mirror) { best_mirror->window_broken = true; best_mirror->break_time = 0.0f; }
     audio_play(&g_app.audio, g_app.sfx_glass_break);
+    /* Start the shatter animation (main loop advances break_time + rebuilds). */
+    g_app.window_anim_timer = WINDOW_BREAK_DURATION;
     renderer_build_level(&g_app.renderer, &g_app.world.lvt, &g_app.world.inf);
     return true;
 }
@@ -3095,6 +3101,28 @@ render_frame:
 
         /* ---- Animated textures ---- */
         renderer_update_anim_textures(&g_app.renderer, dt);
+
+        /* ---- Window shatter animation ----
+         * While a window is playing its break frames, advance each broken
+         * window's break_time and rebuild the level mesh so the frame updates
+         * (the frame is baked into the batched mesh; window breaks are rare and
+         * brief). Once past the animation length the windows hold their final
+         * shattered frame and rebuilding stops. */
+        if (g_app.window_anim_timer > 0.0f) {
+            g_app.window_anim_timer -= dt;
+            LvtLevel *lvt = &g_app.world.lvt;
+            for (u32 si = 0; si < lvt->sector_count; si++) {
+                LvtSector *sec = &lvt->sectors[si];
+                for (u32 wi = 0; wi < sec->wall_count; wi++) {
+                    LvtWall *w = &sec->walls[wi];
+                    if (w->is_window && w->window_broken &&
+                        w->break_time < WINDOW_BREAK_DURATION)
+                        w->break_time += dt;
+                }
+            }
+            renderer_build_level(&g_app.renderer, &g_app.world.lvt, &g_app.world.inf);
+            if (g_app.window_anim_timer < 0.0f) g_app.window_anim_timer = 0.0f;
+        }
 
         /* ---- Render ---- */
         renderer_begin_frame(&g_app.renderer);

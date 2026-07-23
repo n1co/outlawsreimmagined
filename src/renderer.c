@@ -659,6 +659,34 @@ void renderer_add_anim_texture(Renderer *r, u32 base_tex,
     at->loop_start    = (loop_start < n) ? loop_start : 0;
 }
 
+void renderer_register_window_break(Renderer *r, u32 base_tex,
+                                     const u32 *frame_tex, u32 count, f32 fps) {
+    if (!base_tex || count < 2) return;   /* need at least intact + 1 break frame */
+    if (r->window_break_count >= 16) return;
+    /* Dedup by base_tex (all windows of a type share one ATX). */
+    for (u32 i = 0; i < r->window_break_count; i++)
+        if (r->window_breaks[i].base_tex == base_tex) return;
+    u32 n = count < 8 ? count : 8;
+    u32 k = r->window_break_count++;
+    r->window_breaks[k].base_tex = base_tex;
+    r->window_breaks[k].frame_count = n;
+    r->window_breaks[k].fps = (fps > 0.0f) ? fps : 12.0f;
+    for (u32 i = 0; i < n; i++) r->window_breaks[k].frame_tex[i] = frame_tex[i];
+}
+
+u32 renderer_window_frame_tex(const Renderer *r, u32 base_tex,
+                              bool broken, f32 break_time) {
+    for (u32 i = 0; i < r->window_break_count; i++) {
+        if (r->window_breaks[i].base_tex != base_tex) continue;
+        if (!broken) return r->window_breaks[i].frame_tex[0];   /* intact */
+        /* Break frames are indices 1..count-1; play then hold the last. */
+        u32 fi = 1u + (u32)(break_time * r->window_breaks[i].fps);
+        if (fi >= r->window_breaks[i].frame_count) fi = r->window_breaks[i].frame_count - 1;
+        return r->window_breaks[i].frame_tex[fi];
+    }
+    return base_tex;   /* not a registered window */
+}
+
 void renderer_update_anim_textures(Renderer *r, f32 dt) {
     for (u32 i = 0; i < r->anim_texture_count; i++) {
         AnimTexture *at = &r->anim_textures[i];
@@ -1446,16 +1474,23 @@ bool renderer_build_level(Renderer *r, const LvtLevel *level, const InfSystem *i
                      * windows, fences, grilles). The ONLY flag that controls
                      * this is WF1_ADJ_MID_TEX = bit 0 (TFE rwall.h:25,
                      * rsectorFloat.cpp:488-492) — portal structure itself is
-                     * pure geometry. A shot-out glass window is skipped. */
-                    if ((wall->flags & 0x01u) && !wall->window_broken &&
-                        mid_tex > 0 && mid_tex != default_pcx_tex) {
+                     * pure geometry. A glass window renders its break-frame:
+                     * intact frame 0, or (once shot) the shatter frame for its
+                     * break_time (held on the final shattered frame) — it does
+                     * NOT vanish. main.c rebuilds the mesh as break_time advances. */
+                    u32 draw_mid = mid_tex;
+                    if (wall->is_window)
+                        draw_mid = renderer_window_frame_tex(r, mid_tex,
+                                       wall->window_broken, wall->break_time);
+                    if ((wall->flags & 0x01u) &&
+                        draw_mid > 0 && draw_mid != default_pcx_tex) {
                         f32 open_bot = adj_floor > sec->floor_y ? adj_floor : sec->floor_y;
                         f32 open_top = adj_ceil  < sec->ceil_y  ? adj_ceil  : sec->ceil_y;
                         f32 ob0 = aF0 > sF0 ? aF0 : sF0, ob1 = aF1 > sF1 ? aF1 : sF1;
                         f32 ot0 = aC0 < sC0 ? aC0 : sC0, ot1 = aC1 < sC1 ? aC1 : sC1;
                         if (open_top > open_bot) {
-                            u32 mw, mh; tex_dims(r, mid_tex, &mw, &mh);
-                            build_wall_quad(&builders[mid_tex], x0, z0, x1, z1,
+                            u32 mw, mh; tex_dims(r, draw_mid, &mw, &mh);
+                            build_wall_quad(&builders[draw_mid], x0, z0, x1, z1,
                                             ob0, ot0, ob1, ot1,
                                             wall->mid.offset.u, wall->mid.offset.v,
                                             wall_light, wall->flags, mw, mh);

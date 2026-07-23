@@ -255,6 +255,7 @@ int entity_add(EntityList *list, const ObtObject *obj) {
     e->pos        = obj->pos;
     e->yaw        = obj->yaw * OL_DEG2RAD;
     e->sprite_tex = 0;  /* Filled in later when WAX is loaded */
+    e->drop_entity = -1; /* set by world_load for enemies with a DROP_ITEM */
     snprintf(e->type_name, ENTITY_NAME_LEN, "%s", obj->type);
 
     /* Story bosses. SANCHEZ (TOWN) is a special case: he appears at one of ~14
@@ -322,13 +323,20 @@ static void update_enemy(Entity *e, Vec3 player_pos, f32 dt,
     f32 dist  = sqrtf(dx_to*dx_to + dz_to*dz_to);
     e->ai_timer -= dt;
 
-    /* Line-of-sight check: can enemy see the player through sector portals? */
+    /* Line-of-sight check: can enemy see the player through sector portals?
+     * Cached and rechecked ~7×/s (a full 3D sector trace is too costly to run
+     * every frame for every enemy). */
     f32 eye_y = e->pos.y + e->sprite_h * 0.7f; /* enemy eye height */
     f32 player_eye_y = player_pos.y + 5.0f;     /* player eye height */
-    bool can_see = (lvt != NULL)
-        ? collision_has_los(lvt, e->pos.x, e->pos.z, eye_y,
-                            player_pos.x, player_pos.z, player_eye_y)
-        : true;
+    e->los_timer -= dt;
+    if (lvt == NULL) {
+        e->los_cached = true;
+    } else if (e->los_timer <= 0.0f) {
+        e->los_cached = collision_has_los(lvt, e->pos.x, e->pos.z, eye_y,
+                                          player_pos.x, player_pos.z, player_eye_y);
+        e->los_timer = 0.15f;
+    }
+    bool can_see = e->los_cached;
 
     switch (e->ai_state) {
     case AI_IDLE:
@@ -711,7 +719,13 @@ bool entity_damage(EntityList *list, int idx, i32 amount) {
         e->health    = 0;
         e->ai_state  = AI_DEAD;
         e->ai_timer  = 3.0f;  /* Stay as corpse for 3 seconds */
-        /* After that, deactivate (handled in update, but simple: just mark) */
+        /* Loot drop (Outlaws ITM DROP_ITEM → Inv_GroundObject): activate the
+         * pre-spawned ammo-belt pickup at the corpse. */
+        if (e->drop_entity >= 0 && e->drop_entity < (i32)list->count) {
+            Entity *d = &list->entities[e->drop_entity];
+            d->pos    = e->pos;
+            d->active = true;
+        }
         return true;
     }
     /* Non-fatal hit: play the full HIT flinch (chor 1). Hold the pain state for

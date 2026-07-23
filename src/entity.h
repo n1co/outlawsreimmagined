@@ -169,6 +169,16 @@ typedef struct {
     /* Item pickup value */
     i32         pickup_value;
 
+    /* Loot drop: enemies with a non-null ITM DROP_ITEM pre-spawn an inactive
+     * pickup (an ammo belt) at load; `drop_entity` is its index (-1 = none),
+     * activated at the corpse when this enemy dies. */
+    i32         drop_entity;
+
+    /* Cached line-of-sight to the player (recomputed a few times/sec, not every
+     * frame — LOS is a full 3D sector trace). */
+    f32         los_timer;
+    bool        los_cached;
+
     /* Sound effects (set by world_load from olsfx.lab; 0 = none) */
     u32         sfx_hit;   /* Played when entity takes damage */
     u32         sfx_die;   /* Played when entity dies */

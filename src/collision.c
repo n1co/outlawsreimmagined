@@ -299,6 +299,13 @@ static bool wall_is_solid(const LvtLevel *level, i32 si, u32 wi,
     if (w->flags2 & 0x02u)
         return true;
 
+    /* Intact breakable glass window: solid until shot out. Windows are flagged
+     * by is_window (mask wall, bit 0x01) — NOT necessarily ADJOIN_MID (0x2000) —
+     * so this must be checked here, before the geometric open-portal pass, or the
+     * player walks straight through the glass. Once broken it's an open hole. */
+    if (w->is_window && !w->window_broken)
+        return true;
+
     /* WALL_NON_SOLID (flags bit 9, 0x200): always passable.
      * RE docs: "Player and projectiles pass through." */
     if (w->flags & 0x200u)
@@ -313,14 +320,9 @@ static bool wall_is_solid(const LvtLevel *level, i32 si, u32 wi,
      * therefore decided GEOMETRICALLY below, exactly like a normal adjoin.
      * The only genuine solid masks are:
      *   - WF3_SOLID_WALL (flags2 & 0x02) — handled above,
-     *   - breakable glass windows (is_window) — blocked here until shot out.
+     *   - breakable glass windows (is_window) — handled above.
      * Arches remain passable: their opening is a same-floor portal (geometric
      * pass) and/or carries a dadjoin (handled by the DADJOIN branch below). */
-    if (w->flags & LVT_WALL_FLAG_ADJOIN_MID) {
-        if (w->is_window && !w->window_broken)
-            return true; /* intact glass window: solid until broken */
-        /* else: fall through to the geometric step/headroom check */
-    }
 
     const LvtSector *adj = &level->sectors[w->adjoin];
     f32 adj_floor = lvt_floor_at(adj, wmx, wmz);   /* slope-aware at the crossing */
@@ -538,6 +540,46 @@ Vec3 collision_resolve(const LvtLevel *level, Vec3 from, Vec3 to,
  * solid wall. The height parameters (ay, by) are checked against portal
  * floor/ceiling openings so enemies can't "see" through floor/ceiling gaps.
  * ---------------------------------------------------------------------- */
+/* Vertical occlusion: the straight 3D ray a→b must stay inside open sector
+ * space (some sector's [floor,ceil]) the whole way. Sampling in 3D catches any
+ * FLOOR or CEILING slab the ray passes through — the case the 2D portal walk
+ * can't see (stacked storeys, mezzanines inside a tall shell, balconies). A
+ * running sector hint keeps consecutive samples cheap; only a sample that
+ * crosses into a new sector pays the scan. Returns false if the ray hits a slab. */
+static bool los_vertical_clear(const LvtLevel *level, f32 ax, f32 az, f32 ay,
+                               f32 bx, f32 bz, f32 by, int hint) {
+    f32 dx = bx-ax, dz = bz-az, dy = by-ay;
+    f32 d = sqrtf(dx*dx + dz*dz + dy*dy);
+    /* Fine step (1.5u) + tight tolerance (0.1u): the floor slab between stacked
+     * storeys can be as thin as ~0.4u (downstairs ceil 11.8 → upstairs floor
+     * 12.2), so a coarse step/loose tolerance bridges it and misses the block. */
+    int n = (int)(d / 1.5f);
+    if (n < 6) n = 6; else if (n > 128) n = 128;
+    int h = hint;
+    for (int i = 1; i < n; i++) {
+        f32 f = (f32)i / (f32)n;
+        f32 px = ax + f*dx, pz = az + f*dz, py = ay + f*dy;
+        bool open = false;
+        if (h >= 0 && h < (i32)level->sector_count) {
+            const LvtSector *s = &level->sectors[h];
+            if (point_in_sector(s, px, pz)) {
+                f32 sf = lvt_floor_at(s, px, pz), sc = lvt_ceil_at(s, px, pz);
+                if (py >= sf - 0.1f && py <= sc + 0.1f) open = true;
+            }
+        }
+        if (!open) {
+            for (u32 si = 0; si < level->sector_count; si++) {
+                const LvtSector *s = &level->sectors[si];
+                if (!point_in_sector(s, px, pz)) continue;
+                f32 sf = lvt_floor_at(s, px, pz), sc = lvt_ceil_at(s, px, pz);
+                if (py >= sf - 0.1f && py <= sc + 0.1f) { open = true; h = (int)si; break; }
+            }
+        }
+        if (!open) return false;   /* ray is inside a solid floor/ceiling slab */
+    }
+    return true;
+}
+
 bool collision_has_los(const LvtLevel *level, f32 ax, f32 az, f32 ay,
                        f32 bx, f32 bz, f32 by) {
     if (!level || level->sector_count == 0) return false;
@@ -547,13 +589,20 @@ bool collision_has_los(const LvtLevel *level, f32 ax, f32 az, f32 ay,
      * (A plain 2D find can pick a stacked sector at the wrong height.) */
     int cur = -1;
     {
-        f32 best = 1e18f;
+        f32 best_floor = -1e30f, best_d = 1e18f;
         for (u32 si = 0; si < level->sector_count; si++) {
             const LvtSector *s = &level->sectors[si];
             if (!point_in_sector(s, ax, az)) continue;
-            if (ay >= s->floor_y - 1.0f && ay <= s->ceil_y + 1.0f) { cur = (i32)si; break; }
-            f32 d = (ay < s->floor_y) ? (s->floor_y - ay) : (ay - s->ceil_y);
-            if (d < best) { best = d; cur = (i32)si; }
+            f32 f = lvt_floor_at(s, ax, az), c = lvt_ceil_at(s, ax, az);
+            /* Prefer the sector the shooter actually stands IN: the HIGHEST floor
+             * whose [floor,ceil] contains the eye. This keeps an upper-storey
+             * shooter out of a tall lower sector that overlaps in 2D. */
+            if (ay >= f - 1.0f && ay <= c + 1.0f) {
+                if (f > best_floor) { best_floor = f; cur = (i32)si; }
+            } else if (best_floor <= -1e29f) {
+                f32 d = (ay < f) ? (f - ay) : (ay - c);
+                if (d < best_d) { best_d = d; cur = (i32)si; }
+            }
         }
         if (cur < 0) cur = collision_find_sector(level, ax, az, 0);
     }
@@ -576,9 +625,13 @@ bool collision_has_los(const LvtLevel *level, f32 ax, f32 az, f32 ay,
          * behind a solid floor/ceiling — no line of sight (prevents enemies
          * shooting through floors/ceilings). */
         if (point_in_sector(sec, bx, bz)) {
-            if (by >= sec->floor_y - 1.0f && by <= sec->ceil_y + 1.0f)
-                return true;
-            return false;
+            f32 sf = lvt_floor_at(sec, bx, bz), sc = lvt_ceil_at(sec, bx, bz);
+            if (by < sf - 1.0f || by > sc + 1.0f) return false;
+            /* Reached the target's 2D column with the eye inside this sector.
+             * Confirm the straight 3D ray isn't punching through any floor or
+             * ceiling slab along the way (stacked storeys / mezzanines inside a
+             * tall shell) — the 2D portal walk alone can't catch that. */
+            return los_vertical_clear(level, ax, az, ay, bx, bz, by, cur);
         }
 
         /* Find the portal wall we exit through */
@@ -629,8 +682,15 @@ bool collision_has_los(const LvtLevel *level, f32 ax, f32 az, f32 ay,
          * consider BOTH the adjoin and the dadjoin openings: an arch / under-a-
          * bridge shot passes through the LOWER (dadjoin) opening even though it
          * would not fit the upper one. LOS succeeds if the ray fits EITHER. */
-        f32 hx = ax + best_t * rdx, hz = az + best_t * rdz;
-        f32 eye_at_t = ay + best_t * (by - ay);
+        /* Crossing point: best_t is measured from the CURRENT position (cx,cz),
+         * NOT from the start (ax,az) — after the first portal cx≠ax, so the
+         * crossing and the interpolated eye height must use cx/cz and the GLOBAL
+         * ray fraction, else every multi-sector shot's height gate is evaluated
+         * at the wrong spot (was `ax + best_t*rdx`, causing bogus LOS blocks). */
+        f32 hx = cx + best_t * rdx, hz = cz + best_t * rdz;
+        f32 f_global = (ray_len > 1e-5f)
+            ? sqrtf((hx - ax) * (hx - ax) + (hz - az) * (hz - az)) / ray_len : 0.0f;
+        f32 eye_at_t = ay + f_global * (by - ay);
         f32 sF = lvt_floor_at(sec, hx, hz), sC = lvt_ceil_at(sec, hx, hz);
 
         i32 openings[2] = { best_adj, bw->dadjoin };

@@ -289,6 +289,34 @@ static u32 g_missing_tex = 0;
  * (bottom-anchored, growing up) and flat V ((worldZ-offset)*8) then map 1:1 to
  * the engine's texel space. HUD/menu/sprite uploads are untouched (their draw
  * paths use top-down UVs). */
+/* Outlaws window/glass textures (GW032WIN, GW064WIN, GW128WIN, …) store a small
+ * WIDTHx64 window graphic in the TOP-LEFT of a padded 640x480 PCX canvas (the
+ * name's number = the real width). Uploaded at the full canvas size, the tiny
+ * window maps to a sliver of the wall (8 texels/world-unit against a 640-wide
+ * texture) and is effectively invisible. Crop to the content — anchored at the
+ * top-left, where these textures always place it — so it maps/tiles at the
+ * correct scale. Returns a new buffer (caller frees) or NULL if no crop needed. */
+static u8 *crop_topleft_content(const u8 *rgba, u32 *w, u32 *h) {
+    u32 W = *w, H = *h;
+    if (!rgba || W == 0 || H == 0) return NULL;
+    i32 maxx = -1, maxy = -1;
+    for (u32 y = 0; y < H; y++)
+        for (u32 x = 0; x < W; x++)
+            if (rgba[((size_t)y * W + x) * 4 + 3] > 0) {
+                if ((i32)x > maxx) maxx = (i32)x;
+                if ((i32)y > maxy) maxy = (i32)y;
+            }
+    if (maxx < 0) return NULL;                 /* fully transparent */
+    u32 cw = (u32)maxx + 1, ch = (u32)maxy + 1;
+    if (cw >= W && ch >= H) return NULL;       /* fills the canvas — nothing to crop */
+    u8 *out = malloc((size_t)cw * ch * 4);
+    if (!out) return NULL;
+    for (u32 y = 0; y < ch; y++)
+        memcpy(out + (size_t)y * cw * 4, rgba + (size_t)y * W * 4, (size_t)cw * 4);
+    *w = cw; *h = ch;
+    return out;
+}
+
 static void flip_rgba_rows(u8 *rgba, u32 w, u32 h) {
     if (!rgba || h < 2) return;
     u32 stride = w * 4;
@@ -344,6 +372,10 @@ static void upload_level_textures(const LvtLevel *level,
                 rgba = palette ? pcx_decode_rgba_pal(data, size, &w, &h, palette)
                                 : pcx_decode_rgba(data, size, &w, &h);
             if (rgba) {
+                if (is_glass) {
+                    u8 *cr = crop_topleft_content(rgba, &w, &h);
+                    if (cr) { free(rgba); rgba = cr; }
+                }
                 flip_rgba_rows(rgba, w, h);
                 renderer_upload_texture(r, lower_name, rgba, w, h);
                 free(rgba);
@@ -408,8 +440,11 @@ static void upload_level_textures(const LvtLevel *level,
                     for (char *q = fname; *q; q++) { if (*q == '#') { *q = '\0'; break; } }
                     if (fname[0]) snprintf(frame_names[frame_count++], 64, "%s", fname);
                 } else if (strncasecmp(p, "STOP", 4) == 0) {
-                    /* End of passive sequence: static (no loop). */
-                    break;
+                    /* End of the passive sequence. For a glass window, the frames
+                     * AFTER this STOP are the shatter sequence (GWWNx42..x47) —
+                     * keep collecting them so the window can play its break
+                     * animation when shot. For everything else, stop here. */
+                    if (!is_glass) break;
                 } else if (strncasecmp(p, "GOTO", 4) == 0) {
                     /* GOTO [STOP] <instr_index> — loop back. Take the last number
                      * on the line as the target instruction; frame index =
@@ -436,6 +471,7 @@ static void upload_level_textures(const LvtLevel *level,
 
             /* Upload each frame PCX and collect GL handles */
             GLuint handles[R_MAX_ANIM_FRAMES] = {0};
+            u32    tids[R_MAX_ANIM_FRAMES] = {0};
             u32    uploaded = 0;
             bool   base_registered = false;
 
@@ -453,6 +489,10 @@ static void upload_level_textures(const LvtLevel *level,
                     rgba = palette ? pcx_decode_rgba_pal(fd, fs, &w, &h, palette)
                                    : pcx_decode_rgba(fd, fs, &w, &h);
                 if (!rgba) continue;
+                if (is_glass) {
+                    u8 *cr = crop_topleft_content(rgba, &w, &h);
+                    if (cr) { free(rgba); rgba = cr; }
+                }
                 flip_rgba_rows(rgba, w, h);
 
                 /* Name: frame 0 uses the ATX name (for mesh lookup), others get _fN suffix */
@@ -466,8 +506,11 @@ static void upload_level_textures(const LvtLevel *level,
 
                 u32 tid = renderer_upload_texture(r, tex_name, rgba, w, h);
                 free(rgba);
-                if (tid && tid <= R_MAX_TEXTURES)
-                    handles[uploaded++] = r->textures[tid - 1].handle;
+                if (tid && tid <= R_MAX_TEXTURES) {
+                    tids[uploaded] = tid;
+                    handles[uploaded] = r->textures[tid - 1].handle;
+                    uploaded++;
+                }
             }
 
             /* Register the animated texture. Looping textures (GOTO) animate;
@@ -480,6 +523,11 @@ static void upload_level_textures(const LvtLevel *level,
                     renderer_add_anim_texture(r, base_tid, handles, uploaded,
                                               atx_fps, true, ls);
                 }
+                /* Glass window: register the break sequence (frame 0 = intact,
+                 * 1..N = shatter) so a shot window animates then holds the
+                 * shattered frame instead of vanishing. */
+                if (base_tid && is_glass && uploaded >= 2)
+                    renderer_register_window_break(r, base_tid, tids, uploaded, atx_fps);
             }
             atx_done:;
         }
@@ -1438,6 +1486,51 @@ bool world_load(World *world, Archives *arc,
                     e->cur_anim_timer = 0.0f;
                     e->anim_loop = true;
                 }
+            }
+
+            /* Loot drops (Outlaws: enemy ITM DROP_ITEM → a gdropN.itm whose
+             * FUNC is Inv_GroundObject, sprite gambelt.nwx, giving bullets).
+             * Pre-spawn an INACTIVE ammo-belt pickup for each regular enemy whose
+             * ITM names a non-null DROP_ITEM; entity_damage activates it at the
+             * corpse on death. */
+            {
+                u32 orig_count = world->entities.count;
+                u32 dropped = 0;
+                for (u32 i = 0; i < orig_count; i++) {
+                    Entity *en = &world->entities.entities[i];
+                    if (en->kind != ENTITY_ENEMY || en->is_boss) continue;
+                    /* Read the enemy type's ITM DROP_ITEM (E-prefix fallback for
+                     * EBGY1 → BGY1.itm, matching find_def). */
+                    char itm_name[96];
+                    u32 sz = 0; const u8 *data = NULL;
+                    snprintf(itm_name, sizeof(itm_name), "%s.itm", en->type_name);
+                    data = archives_get(arc, itm_name, &sz);
+                    if (!data && (en->type_name[0]=='E'||en->type_name[0]=='e') && en->type_name[1]) {
+                        snprintf(itm_name, sizeof(itm_name), "%s.itm", en->type_name + 1);
+                        data = archives_get(arc, itm_name, &sz);
+                    }
+                    if (!data) continue;
+                    ItmFile itm;
+                    if (!itm_parse(&itm, (const char *)data, sz)) continue;
+                    const char *drop = itm_get_str(&itm, "DROP_ITEM", "null");
+                    if (!drop || !drop[0] || strcasecmp(drop, "null") == 0) continue;
+                    /* Spawn an inactive ammo-belt pickup for this enemy. */
+                    ObtObject o; memset(&o, 0, sizeof(o));
+                    snprintf(o.type, sizeof(o.type), "GAMBELT");
+                    o.pos = en->pos;
+                    int didx = entity_add(&world->entities, &o);
+                    if (didx < 0) break;
+                    Entity *d = &world->entities.entities[didx];
+                    d->active = false;   /* hidden until the enemy dies */
+                    f32 dw = 0, dh = 0;
+                    d->sprite_tex = load_entity_sprite_dirs(d->type_name, arc, r,
+                                        d->sprite_dir_tex, &dw, &dh,
+                                        d->anim_tex, &d->anim_count, &d->anim_dt_ms);
+                    if (dw > 0 && dh > 0) { d->render_w = dw; d->render_h = dh; }
+                    world->entities.entities[i].drop_entity = didx;
+                    dropped++;
+                }
+                if (dropped) OL_LOG("Loot drops: %u enemies carry an ammo belt\n", dropped);
             }
 
             world_progress(0.85f, level_name);

@@ -73,6 +73,8 @@ typedef struct {
     i32    light;           /* Additional light offset */
     bool   is_window;       /* Breakable glass window (mask wall with WIN texture) */
     bool   window_broken;   /* Glass window that has been shot out */
+    f32    break_time;      /* seconds since it shattered (drives the break-frame
+                             * animation); only meaningful while window_broken */
 } LvtWall;
 
 /* A map sector (convex polygon) */

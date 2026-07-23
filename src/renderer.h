@@ -209,6 +209,17 @@ typedef struct {
     AnimTexture anim_textures[R_MAX_ANIM_TEXTURES];
     u32         anim_texture_count;
 
+    /* Window break sequences: a shot window plays its ATX break frames
+     * (GWWNx42..x47) then holds the last (shattered) frame. Keyed by the ATX
+     * base texture id (frame 0 = intact). */
+    struct {
+        u32 base_tex;
+        u32 frame_tex[8];      /* [0]=intact, [1..count-1]=break frames */
+        u32 frame_count;
+        f32 fps;
+    } window_breaks[16];
+    u32 window_break_count;
+
     /* Per-sector UV scroll offsets (updated by renderer_sync_scroll from InfSystem) */
     f32  sector_scroll_u[4096];
     f32  sector_scroll_v[4096];
@@ -364,6 +375,17 @@ void renderer_resize(Renderer *r, int width, int height);
 void renderer_add_anim_texture(Renderer *r, u32 base_tex,
                                const GLuint *frame_handles, u32 count, f32 fps,
                                bool loop, u32 loop_start);
+
+/* Register a window's break sequence: frame_tex[0] = intact, [1..count-1] = the
+ * shatter frames. base_tex is the ATX base texture id the wall references. */
+void renderer_register_window_break(Renderer *r, u32 base_tex,
+                                     const u32 *frame_tex, u32 count, f32 fps);
+
+/* Texture id to render for a window wall given its break state: the intact frame
+ * (break_time < 0 or not broken), the current shatter frame, or the held final
+ * frame. Returns base_tex unchanged if it isn't a registered window. */
+u32 renderer_window_frame_tex(const Renderer *r, u32 base_tex,
+                              bool broken, f32 break_time);
 
 /* Advance animated texture timers and swap current frame handles (call each frame). */
 void renderer_update_anim_textures(Renderer *r, f32 dt);
