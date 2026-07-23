@@ -15,6 +15,9 @@ typedef struct {
     bool  has_boss;        /* level has a boss objective */
     bool  active_boss;     /* boss is present+active from the start (e.g. Slim in
                             * HIDEOUT); false = dormant-spawn boss (Sanchez/TOWN) */
+    bool  kill_all;        /* no boss + no scripted END_LEVEL → clear all enemies
+                            * (battle levels like Civil War civlwar2). Set by the
+                            * app after mission_init once the INF is known. */
     i32   total_enemies;   /* regular (non-boss) enemies present at load */
     bool  boss_spawned;    /* the boss has been activated */
     i32   boss_idx;        /* entity index of the active boss (-1 = none) */

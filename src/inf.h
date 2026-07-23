@@ -179,12 +179,16 @@ typedef enum {
     INF_MSG_DONE,
 } InfMsgType;
 
-/* Event mask bits (which action fires a trigger). Values from Outlaws INF. */
-#define INF_EVENT_CROSS   0x01u   /* Player crosses/enters the sector */
-#define INF_EVENT_ENTER   0x10u   /* Enter sector */
-#define INF_EVENT_LEAVE   0x08u   /* Leave sector */
-#define INF_EVENT_NUDGE   0x20u   /* Nudge (USE / walk into) */
-#define INF_EVENT_SHOOT   0x40u   /* Shot */
+/* Event mask bits — the Jedi/Outlaws INF bitfield (verified: civlwar1 SPAWN
+ * end-level trigger uses EVENT_MASK 4 = ENTER_SECTOR). These are OR'd masks so a
+ * fire covers both line directions / both nudge sides:
+ *   0x01 cross-line front, 0x02 back | 0x04 enter sector | 0x08 leave sector
+ *   0x10 nudge (USE) front, 0x20 back | 0x40 explosion/shot. */
+#define INF_EVENT_CROSS   0x03u   /* Cross a line trigger (front|back) */
+#define INF_EVENT_ENTER   0x04u   /* Enter a sector (was wrongly 0x10) */
+#define INF_EVENT_LEAVE   0x08u   /* Leave a sector */
+#define INF_EVENT_NUDGE   0x30u   /* Nudge / USE (front|back) */
+#define INF_EVENT_SHOOT   0x40u   /* Shot / explosion */
 
 #define INF_MAX_TRIGGERS 512
 
@@ -260,6 +264,11 @@ bool inf_fire_line_ray(InfSystem *inf, const LvtLevel *level,
 /* Try to trigger an elevator by sector index.
  * Called when player presses USE near a door/elevator. */
 void inf_trigger(InfSystem *inf, u32 sector_idx);
+
+/* True if the level has a scripted END_LEVEL (a trigger/elevator that sends
+ * END_LEVEL to SYSTEM) — i.e. an explicit level exit. Levels with neither this
+ * nor a boss use a kill-all-enemies objective. */
+bool inf_has_end_trigger(const InfSystem *inf);
 
 /*
  * Fire all triggers located in `sector_idx` whose EVENT_MASK includes any of

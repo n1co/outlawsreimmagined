@@ -742,36 +742,39 @@ static void mb_push_idx(MeshBuilder *mb, u32 idx) {
     mb->indices[mb->idx_count++] = idx;
 }
 
-static RenderMesh mb_upload(MeshBuilder *mb) {
+/* Upload a builder to GPU. If `reuse` has live GL objects (from the previous
+ * build), re-upload into them (buffer orphaning) instead of creating new VAO/VBO/
+ * IBO — creating/destroying hundreds of GL objects each rebuild stalls the driver
+ * (~36ms on civlwar1); reuse makes a dynamic-INF rebuild cheap. The builder set is
+ * stable across rebuilds (same geometry, only vertex data changes), so reusing the
+ * k-th mesh's buffers is valid; the VAO attrib pointers stay bound to the VBO. */
+static RenderMesh mb_upload(MeshBuilder *mb, const RenderMesh *reuse) {
     RenderMesh mesh = {0};
     if (!mb->vert_count || !mb->idx_count) return mesh;
 
-    glGenVertexArrays(1, &mesh.vao);
-    glGenBuffers(1, &mesh.vbo);
-    glGenBuffers(1, &mesh.ibo);
+    bool reused = reuse && reuse->vao;
+    if (reused) { mesh.vao = reuse->vao; mesh.vbo = reuse->vbo; mesh.ibo = reuse->ibo; }
+    else { glGenVertexArrays(1, &mesh.vao); glGenBuffers(1, &mesh.vbo); glGenBuffers(1, &mesh.ibo); }
 
     glBindVertexArray(mesh.vao);
     glBindBuffer(GL_ARRAY_BUFFER, mesh.vbo);
     glBufferData(GL_ARRAY_BUFFER, mb->vert_count * sizeof(WorldVertex),
-                 mb->verts, GL_STATIC_DRAW);
-
+                 mb->verts, GL_DYNAMIC_DRAW);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, mesh.ibo);
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, mb->idx_count * sizeof(u32),
-                 mb->indices, GL_STATIC_DRAW);
+                 mb->indices, GL_DYNAMIC_DRAW);
 
-    /* pos: location 0, 3 floats */
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(WorldVertex),
-                          (void*)offsetof(WorldVertex, x));
-    glEnableVertexAttribArray(0);
-    /* uv: location 1, 2 floats */
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(WorldVertex),
-                          (void*)offsetof(WorldVertex, u));
-    glEnableVertexAttribArray(1);
-    /* light: location 2, 1 float */
-    glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, sizeof(WorldVertex),
-                          (void*)offsetof(WorldVertex, light));
-    glEnableVertexAttribArray(2);
-
+    if (!reused) {   /* attrib layout only needs setting up once per VAO */
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(WorldVertex),
+                              (void*)offsetof(WorldVertex, x));
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(WorldVertex),
+                              (void*)offsetof(WorldVertex, u));
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(2, 1, GL_FLOAT, GL_FALSE, sizeof(WorldVertex),
+                              (void*)offsetof(WorldVertex, light));
+        glEnableVertexAttribArray(2);
+    }
     glBindVertexArray(0);
 
     mesh.index_count = mb->idx_count;
@@ -1075,7 +1078,8 @@ static void build_floor_poly(MeshBuilder *mb,
 /* Resolve texture id (1-based, 0 = no texture). Clamps to valid range. */
 static u32 resolve_tex(const Renderer *r, const LvtLevel *level, i32 tex_idx) {
     if (tex_idx < 0 || (u32)tex_idx >= level->texture_count) return 0;
-    u32 id = renderer_find_texture(r, level->textures[tex_idx]);
+    u32 id = (tex_idx < LVT_MAX_TEXTURES) ? r->texmap[tex_idx]   /* O(1) cached */
+                                          : renderer_find_texture(r, level->textures[tex_idx]);
     return (id < R_MAX_TEXTURES) ? id : 0;
 }
 
@@ -1090,24 +1094,31 @@ static void tex_dims(const Renderer *r, u32 tex_id, u32 *w, u32 *h) {
 }
 
 bool renderer_build_level(Renderer *r, const LvtLevel *level, const InfSystem *inf) {
-    /* Free old meshes */
-    if (r->level_meshes) {
-        for (u32 i = 0; i < r->level_mesh_count; i++) {
-            glDeleteVertexArrays(1, &r->level_meshes[i].vao);
-            glDeleteBuffers(1, &r->level_meshes[i].vbo);
-            glDeleteBuffers(1, &r->level_meshes[i].ibo);
-        }
-        free(r->level_meshes);
-        r->level_meshes = NULL;
-        r->level_mesh_count = 0;
-    }
+    /* Keep the previous meshes' GL objects so this rebuild can re-upload into them
+     * (buffer reuse) instead of churning VAOs/VBOs — see mb_upload(reuse). */
+    RenderMesh *old_meshes = r->level_meshes;
+    u32 old_count = r->level_mesh_count;
+    r->level_meshes = NULL;
+    r->level_mesh_count = 0;
 
-    if (!level || level->sector_count == 0) return false;
+    if (!level || level->sector_count == 0) {
+        for (u32 i = 0; i < old_count; i++) {
+            glDeleteVertexArrays(1, &old_meshes[i].vao);
+            glDeleteBuffers(1, &old_meshes[i].vbo);
+            glDeleteBuffers(1, &old_meshes[i].ibo);
+        }
+        free(old_meshes);
+        return false;
+    }
 
     /* DEFAULT.PCX now renders like any texture (the original engine draws the
      * slot's handle regardless). Only the MORPH-door leaf workaround still uses
      * this id, to prefer a real panel texture for the swinging apron. */
     u32 default_pcx_tex = renderer_find_texture(r, "default.pcx");
+
+    /* Resolve each level texture index → GL id ONCE (not per wall/flat). */
+    for (u32 i = 0; i < level->texture_count && i < LVT_MAX_TEXTURES; i++)
+        r->texmap[i] = renderer_find_texture(r, level->textures[i]);
 
     /*
      * Texture-batched builders (one per texture slot).
@@ -1470,23 +1481,22 @@ bool renderer_build_level(Renderer *r, const LvtLevel *level, const InfSystem *i
     if (!r->level_meshes) { free(builders); free(sign_builders); return false; }
     r->level_mesh_count = 0;
 
+    #define REUSE_MESH ((r->level_mesh_count < old_count) ? &old_meshes[r->level_mesh_count] : NULL)
     u32 dbg_total_verts = 0, dbg_total_idx = 0;
     for (u32 i = 0; i <= r->texture_count; i++) {
         if (builders[i].vert_count > 0) {
             dbg_total_verts += builders[i].vert_count;
             dbg_total_idx += builders[i].idx_count;
-            RenderMesh m = mb_upload(&builders[i]);
+            RenderMesh m = mb_upload(&builders[i], REUSE_MESH);
             m.sector_idx = 0xFFFFFFFF;
             m.is_scroll_floor = false;
             r->level_meshes[r->level_mesh_count++] = m;
         }
     }
-    OL_LOG("Level mesh totals: %u verts, %u indices (%u tris)\n",
-           dbg_total_verts, dbg_total_idx, dbg_total_idx / 3);
 
     /* Upload dedicated scroll-floor sector meshes */
     for (u32 i = 0; i < scroll_count; i++) {
-        RenderMesh m = mb_upload(&scroll_mb[i]);
+        RenderMesh m = mb_upload(&scroll_mb[i], REUSE_MESH);
         m.sector_idx = scroll_si[i];
         m.is_scroll_floor = true;
         r->level_meshes[r->level_mesh_count++] = m;
@@ -1496,12 +1506,24 @@ bool renderer_build_level(Renderer *r, const LvtLevel *level, const InfSystem *i
      * parts, with polygon offset (see renderer_draw_level). */
     for (u32 i = 0; i <= r->texture_count; i++) {
         if (sign_builders[i].vert_count > 0) {
-            RenderMesh m = mb_upload(&sign_builders[i]);
+            RenderMesh m = mb_upload(&sign_builders[i], REUSE_MESH);
             m.sector_idx = 0xFFFFFFFF;
             m.is_sign = true;
             r->level_meshes[r->level_mesh_count++] = m;
         }
     }
+    #undef REUSE_MESH
+
+    /* Delete any leftover old meshes not reused this build (build had fewer). */
+    for (u32 i = r->level_mesh_count; i < old_count; i++) {
+        glDeleteVertexArrays(1, &old_meshes[i].vao);
+        glDeleteBuffers(1, &old_meshes[i].vbo);
+        glDeleteBuffers(1, &old_meshes[i].ibo);
+    }
+    free(old_meshes);
+    if (getenv("OL_MESHLOG"))
+        OL_LOG("Level mesh totals: %u verts, %u indices (%u tris)\n",
+               dbg_total_verts, dbg_total_idx, dbg_total_idx / 3);
 
     free(builders);
     free(sign_builders);

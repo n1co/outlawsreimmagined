@@ -127,6 +127,11 @@ typedef struct {
     GpuTexture textures[R_MAX_TEXTURES];
     u32        texture_count;
 
+    /* Level texture-index → GL texture id map, computed once per level-mesh build.
+     * Avoids an O(walls × GL-textures) name lookup during rebuilds (was ~36ms on
+     * civlwar1, tanking FPS whenever an elevator moved). */
+    u32        texmap[LVT_MAX_TEXTURES];
+
     /* Level geometry */
     RenderMesh *level_meshes;
     u32         level_mesh_count;

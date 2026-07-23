@@ -9,6 +9,7 @@
  * heights are known; this file computes intent, eye transitions and bob.
  */
 #include "player.h"
+#include "settings.h"
 
 void player_init(Player *p, Vec3 start_pos) {
     memset(p, 0, sizeof(*p));
@@ -32,39 +33,32 @@ bool player_update(Player *p, const InputState *input, f32 dt,
         return false;
     }
 
-    /* ---- Mouse look ---- */
-    if (input->mouse_captured) {
-        p->yaw   -= input->mouse_dx * PLAYER_MOUSE_SENS;
-        p->pitch -= input->mouse_dy * PLAYER_MOUSE_SENS;
+    /* ---- Mouse look (sensitivity + invert from settings) ---- */
+    if (input->mouse_captured && g_settings.mouse_enabled) {
+        f32 sens = PLAYER_MOUSE_SENS * g_settings.mouse_sensitivity;
+        p->yaw   -= input->mouse_dx * sens;
+        p->pitch -= input->mouse_dy * sens * (g_settings.mouse_invert ? -1.0f : 1.0f);
     }
 
     /* ---- Keyboard look (BODY_YAW_RATE 150°/s, PITCH_RATE 160°/s) ---- */
+    #define HELD(a) input_key_held(input, (SDL_Scancode)g_settings.bind[(a)])
     f32 yaw_rate = PHY_BODY_YAW_RATE * OL_DEG2RAD;
-    if (input_key_held(input, SDL_SCANCODE_LEFT))
-        p->yaw += yaw_rate * dt;
-    if (input_key_held(input, SDL_SCANCODE_RIGHT))
-        p->yaw -= yaw_rate * dt;
-    if (input_key_held(input, SDL_SCANCODE_PAGEUP))
-        p->pitch += PHY_PITCH_RATE * OL_DEG2RAD * dt;
-    if (input_key_held(input, SDL_SCANCODE_PAGEDOWN))
-        p->pitch -= PHY_PITCH_RATE * OL_DEG2RAD * dt;
+    if (HELD(BIND_TURN_L)) p->yaw += yaw_rate * dt;
+    if (HELD(BIND_TURN_R)) p->yaw -= yaw_rate * dt;
+    if (HELD(BIND_LOOK_UP))   p->pitch += PHY_PITCH_RATE * OL_DEG2RAD * dt;
+    if (HELD(BIND_LOOK_DOWN)) p->pitch -= PHY_PITCH_RATE * OL_DEG2RAD * dt;
     p->pitch = OL_CLAMP(p->pitch, -PLAYER_MAX_PITCH, PLAYER_MAX_PITCH);
 
     /* ---- Intent ---- */
-    p->running = input_key_held(input, SDL_SCANCODE_LSHIFT) ||
-                 input_key_held(input, SDL_SCANCODE_RSHIFT);
-    p->crouching = input_key_held(input, SDL_SCANCODE_LCTRL) ||
-                   input_key_held(input, SDL_SCANCODE_RCTRL) ||
-                   input_key_held(input, SDL_SCANCODE_C);
+    p->running   = HELD(BIND_RUN);
+    p->crouching = HELD(BIND_CROUCH);
     f32 intent = p->running ? PHY_RUN_MULT : 1.0f;   /* "Fast" = 1.5 */
 
     f32 fwd_in = 0.0f, str_in = 0.0f;
-    if (input_key_held(input, SDL_SCANCODE_W) || input_key_held(input, SDL_SCANCODE_UP))
-        fwd_in += 1.0f;
-    if (input_key_held(input, SDL_SCANCODE_S) || input_key_held(input, SDL_SCANCODE_DOWN))
-        fwd_in -= 1.0f;
-    if (input_key_held(input, SDL_SCANCODE_D)) str_in += 1.0f;
-    if (input_key_held(input, SDL_SCANCODE_A)) str_in -= 1.0f;
+    if (HELD(BIND_FORWARD))  fwd_in += 1.0f;
+    if (HELD(BIND_BACK))     fwd_in -= 1.0f;
+    if (HELD(BIND_STRAFE_R)) str_in += 1.0f;
+    if (HELD(BIND_STRAFE_L)) str_in -= 1.0f;
 
     /* World-space wish direction from player-relative intent */
     f32 cy = cosf(p->yaw), sy = sinf(p->yaw);
@@ -120,7 +114,8 @@ bool player_update(Player *p, const InputState *input, f32 dt,
     p->pos.z += p->vel.z * dt;
 
     /* ---- Jump request (consumed by vertical physics in main.c) ---- */
-    if (input_key_pressed(input, SDL_SCANCODE_SPACE))
+    #define PRESSED(a) input_key_pressed(input, (SDL_Scancode)g_settings.bind[(a)])
+    if (PRESSED(BIND_JUMP))
         p->want_jump = true;
 
     /* ---- Energy (stamina): drains only while SPRINTING; recovers
@@ -162,20 +157,20 @@ bool player_update(Player *p, const InputState *input, f32 dt,
     }
 
     /* ---- Weapon selection ---- */
-    if (input_key_pressed(input, SDL_SCANCODE_1)) weapon_switch(&p->weapons, WEAPON_FIST);
-    if (input_key_pressed(input, SDL_SCANCODE_2)) weapon_switch(&p->weapons, WEAPON_PISTOL);
-    if (input_key_pressed(input, SDL_SCANCODE_3)) weapon_switch(&p->weapons, WEAPON_RIFLE);
-    if (input_key_pressed(input, SDL_SCANCODE_4)) weapon_switch(&p->weapons, WEAPON_SHOTGUN);
-    if (input_key_pressed(input, SDL_SCANCODE_5)) weapon_switch(&p->weapons, WEAPON_DBL_SHOTGUN);
-    if (input_key_pressed(input, SDL_SCANCODE_6)) weapon_switch(&p->weapons, WEAPON_SAW_GUN);
-    if (input_key_pressed(input, SDL_SCANCODE_7)) weapon_switch(&p->weapons, WEAPON_DYNAMITE);
-    if (input_key_pressed(input, SDL_SCANCODE_8)) weapon_switch(&p->weapons, WEAPON_KNIFE);
-    if (input_key_pressed(input, SDL_SCANCODE_9)) weapon_switch(&p->weapons, WEAPON_GATLING);
+    if (PRESSED(BIND_WEAPON_1)) weapon_switch(&p->weapons, WEAPON_FIST);
+    if (PRESSED(BIND_WEAPON_2)) weapon_switch(&p->weapons, WEAPON_PISTOL);
+    if (PRESSED(BIND_WEAPON_3)) weapon_switch(&p->weapons, WEAPON_RIFLE);
+    if (PRESSED(BIND_WEAPON_4)) weapon_switch(&p->weapons, WEAPON_SHOTGUN);
+    if (PRESSED(BIND_WEAPON_5)) weapon_switch(&p->weapons, WEAPON_DBL_SHOTGUN);
+    if (PRESSED(BIND_WEAPON_6)) weapon_switch(&p->weapons, WEAPON_SAW_GUN);
+    if (PRESSED(BIND_WEAPON_7)) weapon_switch(&p->weapons, WEAPON_DYNAMITE);
+    if (PRESSED(BIND_WEAPON_8)) weapon_switch(&p->weapons, WEAPON_KNIFE);
+    if (PRESSED(BIND_WEAPON_9)) weapon_switch(&p->weapons, WEAPON_GATLING);
 
-    if (input_key_pressed(input, SDL_SCANCODE_EQUALS))
-        weapon_cycle_next(&p->weapons);
-    if (input_key_pressed(input, SDL_SCANCODE_MINUS))
-        weapon_cycle_prev(&p->weapons);
+    if (PRESSED(BIND_NEXT_WEAPON)) weapon_cycle_next(&p->weapons);
+    if (PRESSED(BIND_PREV_WEAPON)) weapon_cycle_prev(&p->weapons);
+    #undef PRESSED
+    #undef HELD
 
     /* ---- Weapon update ---- */
     weapon_update(&p->weapons, dt);

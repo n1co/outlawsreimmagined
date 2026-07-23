@@ -24,6 +24,9 @@ void debug_ui_init(SDL_Window *window, SDL_GLContext gl_ctx) {
     ImGuiIO &io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.IniFilename = NULL; /* Don't save layout */
+    /* The front-end menu hides the OS cursor (it draws the pointing-hand cursor
+     * itself), so let ImGui render its own cursor for the debug panel. */
+    io.MouseDrawCursor = true;
 
     ImGui::StyleColorsDark();
     ImGuiStyle &style = ImGui::GetStyle();

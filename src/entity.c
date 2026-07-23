@@ -111,6 +111,11 @@ static const EntityDef s_defs[] = {
     { "BOBGRAH",      ENTITY_ENEMY,       18,  0,  7,  8, 140},
     { "EBILLMOR",     ENTITY_ENEMY,        8,  0,  7,  8, 140},
     { "BILLMOR",      ENTITY_ENEMY,       14,  0,  7,  8, 140},
+    /* TRAIN boss "Timber Bloodeye" (Bloodeye_New): ETIMBLOO (easy variant, hp7)
+     * and TIMBLOOD (default/hard variant, hp14) spawn by difficulty at the same
+     * spot; sprite = Timblood.NWX via the ITM ANIM field. */
+    { "ETIMBLOO",     ENTITY_ENEMY,        7,  0,  7,  8, 140},
+    { "TIMBLOOD",     ENTITY_ENEMY,       14,  0,  7,  8, 140},
 
     /* Health pickups */
     { "GDOCBAG",      ENTITY_ITEM_HEALTH, 0,  50,  8,  8,   0},
@@ -179,39 +184,47 @@ static const EntityDef s_defs[] = {
     { "SWIND",        ENTITY_DECORATION,  0,   0,  0,  0,   0},
     { "SVULTURE",     ENTITY_DECORATION,  0,   0,  0,  0,   0},
 
+    /* Historical-mission named enemies (Civil War / Villa / Wharf rosters, from
+     * their .obb object lists). Health approximate. E-prefixed variants and the
+     * EBGY* soldiers are handled by the E-prefix fallback in find_def(). */
+    { "CONFED",       ENTITY_ENEMY,        3,  0,  6,  7, 100},  /* confederate soldier */
+    { "GATGUY",       ENTITY_ENEMY,        6,  0,  6,  8, 120},  /* gatling gunner */
+    { "CROWE",        ENTITY_ENEMY,       10,  0,  7,  8, 130},
+    { "DORSEY",       ENTITY_ENEMY,       10,  0,  7,  8, 130},
+    { "KENNY",        ENTITY_ENEMY,        4,  0,  6,  7,  90},
+    { "HARGROVE",     ENTITY_ENEMY,       12,  0,  7,  8, 130},
+
     /* Triggers */
     { "TRIGGER",      ENTITY_TRIGGER,     0,   0,  0,  0,   0},
     { "DOOR",         ENTITY_TRIGGER,     0,   0,  0,  0,   0},
 };
 static const int s_def_count = (int)(sizeof(s_defs)/sizeof(s_defs[0]));
 
-EntityKind entity_classify(const char *type_name) {
-    if (!type_name || !type_name[0]) return ENTITY_DECORATION;
-    for (int i = 0; i < s_def_count; i++) {
-        if (strcasecmp(s_defs[i].type_name, type_name) == 0)
-            return s_defs[i].kind;
-    }
-    /* Prefix match for variants */
+/* Core lookup: exact match, then prefix match. Returns the def or NULL. */
+static const EntityDef *lookup_def(const char *type_name) {
+    if (!type_name || !type_name[0]) return NULL;
+    for (int i = 0; i < s_def_count; i++)
+        if (strcasecmp(s_defs[i].type_name, type_name) == 0) return &s_defs[i];
     for (int i = 0; i < s_def_count; i++) {
         size_t plen = strlen(s_defs[i].type_name);
-        if (strncasecmp(s_defs[i].type_name, type_name, plen) == 0)
-            return s_defs[i].kind;
+        if (strncasecmp(s_defs[i].type_name, type_name, plen) == 0) return &s_defs[i];
     }
-    return ENTITY_DECORATION;
+    return NULL;
 }
 
 static const EntityDef *find_def(const char *type_name) {
-    if (!type_name) return NULL;
-    for (int i = 0; i < s_def_count; i++) {
-        if (strcasecmp(s_defs[i].type_name, type_name) == 0)
-            return &s_defs[i];
-    }
-    for (int i = 0; i < s_def_count; i++) {
-        size_t plen = strlen(s_defs[i].type_name);
-        if (strncasecmp(s_defs[i].type_name, type_name, plen) == 0)
-            return &s_defs[i];
-    }
-    return NULL;
+    const EntityDef *d = lookup_def(type_name);
+    /* Historical missions prefix enemy types with 'E' (EBGY8, EBGY9WA2, ...).
+     * If nothing matched, retry without the leading E so they resolve to their
+     * base enemy def (only enemy types carry the E prefix; items are G-prefixed). */
+    if (!d && type_name && (type_name[0] == 'E' || type_name[0] == 'e') && type_name[1])
+        d = lookup_def(type_name + 1);
+    return d;
+}
+
+EntityKind entity_classify(const char *type_name) {
+    const EntityDef *d = find_def(type_name);
+    return d ? d->kind : ENTITY_DECORATION;
 }
 
 /* -------------------------------------------------------------------------
@@ -257,7 +270,9 @@ int entity_add(EntityList *list, const ObtObject *obj) {
                strncasecmp(obj->type, "BOBGRAH", 7) == 0 ||
                strncasecmp(obj->type, "EBOBGRAH", 8) == 0 ||
                strncasecmp(obj->type, "BILLMOR", 7) == 0 ||
-               strncasecmp(obj->type, "EBILLMOR", 8) == 0) {
+               strncasecmp(obj->type, "EBILLMOR", 8) == 0 ||
+               strncasecmp(obj->type, "TIMBLOOD", 8) == 0 ||
+               strncasecmp(obj->type, "ETIMBLOO", 8) == 0) {
         e->is_boss = true;    /* active from the start (kept active below) */
     }
 

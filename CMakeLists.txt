@@ -43,6 +43,7 @@ set(ENGINE_SOURCES
     src/lab.c
     src/pcx.c
     src/lvt.c
+    src/lvb.c
     src/wax.c
     src/tdo.c
     src/obt.c
@@ -63,6 +64,7 @@ set(ENGINE_SOURCES
     src/laf.c
     src/savegame.c
     src/smush.c
+    src/settings.c
 )
 
 # ImGui (C++ compiled separately)

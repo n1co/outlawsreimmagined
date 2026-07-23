@@ -18,11 +18,16 @@ typedef enum {
     MENU_MAIN = 0,
     MENU_MISSION,    /* Story: wanted-poster mission select (debug only now) */
     MENU_MP,         /* Multiplayer map select */
-    MENU_OPTIONS,
+    MENU_OPTIONS,    /* options hub (VOLUME / CONTROLS / VIDEO) */
     MENU_INGAME,     /* menu dismissed — the game is running */
     MENU_PAUSE,      /* in-game pause overlay */
     MENU_SAVE,       /* pause: save-game slot list */
-    MENU_LOAD,       /* pause: load-game slot list */
+    MENU_LOAD,       /* save-game slot list (from pause OR main menu) */
+    MENU_HISTORICAL, /* standalone "Historical Missions" list */
+    MENU_DIFFICULTY, /* GOOD/BAD/UGLY skill pick before a launch */
+    MENU_OPT_VOLUME, /* options: 5 volume channels */
+    MENU_OPT_CONTROLS,/* options: key bindings + mouse */
+    MENU_OPT_VIDEO,  /* options: resolution + fullscreen */
 } MenuScreen;
 
 struct Archives;  /* fwd (defined in world.h) */
@@ -31,6 +36,10 @@ typedef struct {
     MenuScreen screen;
     int   sel;                 /* highlighted item / poster */
     u32   tex_main, tex_pick, tex_opts;
+    u32   tex_diff;            /* difficulty screen bg (md220c: cave, parchment right) */
+    u32   tex_choose;          /* choose-game bg (MC220: mesas, parchment right) */
+    u32   tex_hand;            /* pointing-hand cursor (GCURSOR cell 0) */
+    f32   hand_w, hand_h;      /* hand cell aspect (world px) */
     bool  assets_loaded;
     bool  prev_click;          /* mouse button edge tracking */
 
@@ -42,6 +51,20 @@ typedef struct {
     bool  want_quit;
     char  start_level[64];     /* non-empty → load this level and enter game */
     bool  start_story;         /* STORY chosen → begin the campaign at level 1 */
+    bool  start_historical;    /* Historical mission → run its .rca campaign */
+    int   chosen_difficulty;   /* skill (1..3) chosen for this launch */
+
+    /* Deferred launch: a game type was picked but waits on the difficulty screen. */
+    int   pending_kind;        /* 0=none, 1=story, 2=single level */
+    char  pending_level[64];
+    MenuScreen diff_return;     /* where CANCEL on the difficulty screen returns */
+
+    /* Options / settings edit state */
+    int   rebind_action;       /* BIND_* awaiting a key, or -1 */
+    int   ctrl_scroll;         /* controls list scroll offset */
+    bool  apply_video;         /* → app: apply g_settings win_w/h/fullscreen */
+    bool  settings_dirty;      /* → app: persist settings (outlaws.cfg) */
+    MenuScreen load_return;     /* where LOAD returns / who invoked it */
 
     /* Pause-menu outputs (consumed + cleared by the app each frame). */
     bool  want_resume;         /* RESUME / ESC → unpause */
@@ -55,8 +78,11 @@ typedef struct {
 
     MenuScreen return_screen;  /* where OPTIONS returns to (main vs pause) */
 
-    /* Menu click sound (0 = none) */
+    /* Menu sounds (0 = none): navigate blip, activate/select, back. */
     u32   sfx_click;
+    u32   sfx_nav;
+    u32   sfx_select;
+    u32   sfx_back;
 
     /* Authentic Outlaws fonts (mf3s.laf = big, sf3.laf = small). */
     LafFont font_big;

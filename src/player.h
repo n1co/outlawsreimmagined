@@ -25,6 +25,11 @@
 #define PHY_DECEL_XZ           80.0f
 #define PHY_MAX_VEL            30.0f
 #define PHY_JUMP_VEL           20.0f
+#define PHY_AIR_GRAVITY       -60.0f   /* LVT GRAVITY default = air/surface-slab
+                                        * gravity. Water VOLUME sectors carry a
+                                        * buoyant -10; once you breach ABOVE the
+                                        * waterline you're in air, so a jump-out
+                                        * arc must use this, not the -10. */
 #define PHY_STEP_HEIGHT         3.0f
 #define PHY_STEP_SPEED         25.0f
 #define PHY_BODY_YAW_RATE     150.0f   /* deg/s */

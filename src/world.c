@@ -2,6 +2,7 @@
  * world.c - World/level management
  */
 #include "world.h"
+#include "lvb.h"
 #include "pcx.h"
 #include "obt.h"
 #include "wax.h"
@@ -998,16 +999,30 @@ bool world_load(World *world, Archives *arc,
 
     OL_LOG("Loading level: %s\n", level_name);
 
-    /* Load LVT — patches/DLC override the base archive (archives_get). */
+    /* Load LVT — patches/DLC override the base archive (archives_get). Prefer the
+     * text .LVT; fall back to the binary .lvb (historical missions ship only as
+     * .lvb — same data, tagged binary chunk stream; see lvb.c). */
     u32 lvt_size = 0;
     const u8 *lvt_data = archives_get(arc, lvt_name, &lvt_size);
-    if (!lvt_data) {
-        OL_ERR("LVT not found: %s\n", lvt_name);
-        return false;
+    bool parsed = false;
+    if (lvt_data && lvt_size >= 4 && memcmp(lvt_data, "LVT ", 4) == 0) {
+        parsed = lvt_parse(&world->lvt, (const char *)lvt_data, lvt_size);
+    } else if (lvt_data && lvb_is_binary(lvt_data, lvt_size)) {
+        parsed = lvb_parse(&world->lvt, lvt_data, lvt_size);
+    } else if (lvt_data) {
+        parsed = lvt_parse(&world->lvt, (const char *)lvt_data, lvt_size);
     }
-
-    if (!lvt_parse(&world->lvt, (const char *)lvt_data, lvt_size)) {
-        OL_ERR("Failed to parse LVT: %s\n", lvt_name);
+    if (!parsed) {
+        /* Try the binary .lvb explicitly (no text .LVT present). */
+        char lvb_name[128];
+        snprintf(lvb_name, sizeof(lvb_name), "%s.lvb", level_name);
+        u32 lvb_size = 0;
+        const u8 *lvb_data = archives_get(arc, lvb_name, &lvb_size);
+        if (lvb_data && lvb_is_binary(lvb_data, lvb_size))
+            parsed = lvb_parse(&world->lvt, lvb_data, lvb_size);
+    }
+    if (!parsed) {
+        OL_ERR("Failed to load level geometry: %s\n", lvt_name);
         return false;
     }
 
@@ -1084,9 +1099,9 @@ bool world_load(World *world, Archives *arc,
             char name[LVT_MAX_NAME + 8];
             snprintf(name, sizeof(name), "%s.pcx", world->lvt.palette_name);
             u32 psize = 0;
-            const u8 *pdata = lab_get(&arc->main, name, &psize);
-            if (!pdata) pdata = lab_get(&arc->tex, name, &psize);
-            if (!pdata) pdata = lab_get(&arc->geo, name, &psize);
+            /* archives_get searches the DLC/patch labs too — the historical
+             * missions' palettes (Y1Icmap etc.) live in olpatch3. */
+            const u8 *pdata = archives_get(arc, name, &psize);
             if (pdata && psize > 769 && pdata[psize - 769] == 0x0C) {
                 const u8 *pal = pdata + psize - 769 + 1;
                 for (int c = 0; c < 256; c++) {
@@ -1304,10 +1319,25 @@ bool world_load(World *world, Archives *arc,
 
     u32 obt_size = 0;
     const u8 *obt_data = archives_get(arc, obt_name, &obt_size);
+    /* Historical missions ship objects as binary .obb (not text .OBT). */
+    bool obt_is_binary = false;
+    if (!obt_data || (obt_size >= 8 && !(obt_data[0]=='O'&&obt_data[1]=='B'&&obt_data[2]=='T'))) {
+        if (!obt_data || obb_is_binary(obt_data, obt_size)) {
+            char obb_name[128];
+            snprintf(obb_name, sizeof(obb_name), "%s.obb", level_name);
+            u32 obb_size = 0;
+            const u8 *obb_data = archives_get(arc, obb_name, &obb_size);
+            if (obb_data && obb_is_binary(obb_data, obb_size)) {
+                obt_data = obb_data; obt_size = obb_size; obt_is_binary = true;
+            }
+        }
+    }
 
     if (obt_data) {
         ObtTable obt = {0};
-        if (obt_parse(&obt, (const char *)obt_data, obt_size)) {
+        bool ok = obt_is_binary ? obb_parse(&obt, obt_data, obt_size)
+                                : obt_parse(&obt, (const char *)obt_data, obt_size);
+        if (ok) {
             /* Extract player start */
             ObtObject *starts[4];
             u32 n = obt_find_by_type(&obt, "PLAYER", starts, 4);
@@ -1419,8 +1449,16 @@ bool world_load(World *world, Archives *arc,
 
     /* Mission / boss objective (Sanchez in TOWN). */
     mission_init(&world->mission, &world->entities);
+    /* Boss-less battle levels with no scripted exit (e.g. Civil War civlwar2)
+     * complete by clearing all enemies — Outlaws' goal, which we don't model. */
+    world->mission.kill_all = !world->mission.has_boss &&
+                              !inf_has_end_trigger(&world->inf) &&
+                              world->mission.total_enemies > 0;
     if (world->mission.has_boss)
         OL_LOG("Mission: boss level, %d regular enemies\n",
+               world->mission.total_enemies);
+    else if (world->mission.kill_all)
+        OL_LOG("Mission: kill-all-enemies objective (%d enemies)\n",
                world->mission.total_enemies);
 
     /* Fallback player start: center of first sector */

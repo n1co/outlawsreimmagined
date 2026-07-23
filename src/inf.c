@@ -1463,6 +1463,23 @@ void inf_auto_doors(InfSystem *inf, const LvtLevel *level,
     }
 }
 
+bool inf_has_end_trigger(const InfSystem *inf) {
+    for (u32 i = 0; i < inf->trigger_count; i++)
+        if (inf->triggers[i].to_system && inf->triggers[i].msg == INF_MSG_END_LEVEL)
+            return true;
+    for (u32 i = 0; i < inf->count; i++)
+        if (inf->elevs[i].self_to_system && inf->elevs[i].self_msg == INF_MSG_END_LEVEL)
+            return true;
+    /* Per-stop messages can also send END_LEVEL to SYSTEM. */
+    for (u32 i = 0; i < inf->count; i++)
+        for (u32 s = 0; s < inf->elevs[i].stop_count; s++)
+            for (u32 m = 0; m < inf->elevs[i].stops[s].msg_count; m++)
+                if (inf->elevs[i].stops[s].msgs[m].to_system &&
+                    inf->elevs[i].stops[s].msgs[m].type == INF_MSG_END_LEVEL)
+                    return true;
+    return false;
+}
+
 void inf_trigger(InfSystem *inf, u32 sector_idx) {
     for (u32 i = 0; i < inf->count; i++) {
         Elevator *el = &inf->elevs[i];

@@ -30,6 +30,9 @@ static void boss_display_name(const char *type, char *out, int cap) {
     if (strncasecmp(type, "EBILLMOR", 8) == 0 || strncasecmp(type, "BILLMOR", 7) == 0) {
         snprintf(out, cap, "BILL MORGAN"); return;
     }
+    if (strncasecmp(type, "ETIMBLOO", 8) == 0 || strncasecmp(type, "TIMBLOO", 7) == 0) {
+        snprintf(out, cap, "BLOODEYE TIM"); return;   /* LOCAL.MSG #835 */
+    }
     snprintf(out, cap, "THE OUTLAW");
 }
 
@@ -109,7 +112,23 @@ static i32 spawn_boss(EntityList *entities, Vec3 player_pos) {
 
 void mission_update(MissionState *m, EntityList *entities, Vec3 player_pos,
                     const char **out_message, bool *out_complete) {
-    if (!m->has_boss || m->complete) return;
+    if (m->complete) return;
+
+    /* Kill-all objective: a boss-less battle level with no scripted END_LEVEL
+     * (e.g. Civil War civlwar2) — clear every enemy to complete. */
+    if (m->kill_all) {
+        if (m->total_enemies > 0 && alive_regular_enemies(entities) == 0) {
+            m->complete = true;
+            snprintf(m->objective, sizeof(m->objective), "AREA CLEARED");
+            if (out_message)  *out_message  = "ALL ENEMIES DEFEATED - LEVEL COMPLETE";
+            if (out_complete) *out_complete = true;
+        } else {
+            snprintf(m->objective, sizeof(m->objective), "ELIMINATE ALL ENEMIES");
+        }
+        return;
+    }
+
+    if (!m->has_boss) return;
 
     /* Active-boss levels (Slim/HIDEOUT): the boss is already out; the level
      * completes when every boss entity is dead. */

@@ -21,6 +21,7 @@
 #include "wax.h"
 #include "debug_ui.h"
 #include "menu.h"
+#include "settings.h"
 #include "savegame.h"
 #include "projectile.h"
 #include "tdo.h"
@@ -1242,6 +1243,47 @@ static void rcs_token(const char **pp, const char *end, char *buf, int cap) {
     *pp = p;
 }
 
+/* Parse a STORY block (LEVEL/MOVIE/CREDITS ... END) from an RCS/RCA resource into
+ * the campaign arrays. Returns the level count (0 if the resource is missing/empty).
+ * Shared by the main story (OUTLAWS.RCS) and the historical missions' own .rca. */
+static int campaign_parse_rcs(const char *resource) {
+    g_app.campaign_count = 0;
+    for (int i = 0; i < 16; i++) g_app.campaign_movie[i][0] = '\0';
+    u32 sz = 0;
+    const u8 *d = archives_get(&g_app.archives, resource, &sz);
+    if (d && sz > 0) {
+        const char *p = (const char *)d, *end = p + sz;
+        int last_level = -1;
+        bool ended = false;
+        while (p < end && g_app.campaign_count < 16 && !ended) {
+            if ((size_t)(end - p) >= 6 && strncasecmp(p, "LEVEL:", 6) == 0) {
+                p += 6;
+                rcs_token(&p, end, g_app.campaign[g_app.campaign_count],
+                          (int)sizeof(g_app.campaign[0]));
+                if (g_app.campaign[g_app.campaign_count][0]) {
+                    last_level = g_app.campaign_count;
+                    g_app.campaign_count++;
+                }
+            } else if (((size_t)(end - p) >= 6 && strncasecmp(p, "MOVIE:", 6) == 0) ||
+                       ((size_t)(end - p) >= 8 && strncasecmp(p, "CREDITS:", 8) == 0)) {
+                int kw = (strncasecmp(p, "MOVIE:", 6) == 0) ? 6 : 8;
+                p += kw;
+                char tok[32];
+                rcs_token(&p, end, tok, sizeof(tok));
+                if (tok[0] && last_level >= 0)
+                    snprintf(g_app.campaign_movie[last_level], 32, "%s", tok);
+            } else if ((size_t)(end - p) >= 3 && strncasecmp(p, "END", 3) == 0 &&
+                       (p + 3 >= end || p[3] == '\r' || p[3] == '\n' ||
+                        p[3] == ' ' || p[3] == '\t')) {
+                if (g_app.campaign_count > 0) ended = true; else p++;
+            } else {
+                p++;
+            }
+        }
+    }
+    return g_app.campaign_count;
+}
+
 static void campaign_parse(void) {
     g_app.campaign_count = 0;
     g_app.campaign_open_movie[0] = '\0';
@@ -1320,6 +1362,21 @@ static void refresh_save_slots(void) {
     for (int i = 0; i < SAVE_SLOTS; i++)
         g_app.menu.slot_used[i] =
             savegame_peek(i, g_app.menu.slot_label[i], sizeof(g_app.menu.slot_label[i]));
+}
+
+/* Apply the resolution/fullscreen from g_settings to the live window. */
+static void apply_video_settings(void) {
+    SDL_Window *w = g_app.renderer.window;
+    if (!w) return;
+    if (g_settings.fullscreen) {
+        SDL_SetWindowFullscreen(w, SDL_WINDOW_FULLSCREEN_DESKTOP);
+    } else {
+        SDL_SetWindowFullscreen(w, 0);
+        SDL_SetWindowSize(w, g_settings.win_w, g_settings.win_h);
+        SDL_SetWindowPosition(w, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+    }
+    int ww = 0, hh = 0; SDL_GetWindowSize(w, &ww, &hh);
+    if (ww > 0 && hh > 0) renderer_resize(&g_app.renderer, ww, hh);
 }
 
 /* Snapshot the current game into a save slot. */
@@ -1441,10 +1498,15 @@ static bool app_init(int argc, char **argv) {
         return false;
     }
 
-    /* Initialize renderer */
+    /* Load persistent settings (outlaws.cfg) — needed before any input read
+     * (key bindings) and before the renderer (window resolution). Write the
+     * defaults out on first run so the file exists and is discoverable. */
+    if (!settings_load(&g_settings)) settings_save(&g_settings);
+
+    /* Initialize renderer at the saved resolution. */
     RenderConfig rcfg = {
-        .width      = DEFAULT_WIDTH,
-        .height     = DEFAULT_HEIGHT,
+        .width      = g_settings.win_w > 0 ? g_settings.win_w : DEFAULT_WIDTH,
+        .height     = g_settings.win_h > 0 ? g_settings.win_h : DEFAULT_HEIGHT,
         .fov        = DEFAULT_FOV,
         .near_plane = 1.0f,
         .far_plane  = 2048.0f,
@@ -1519,6 +1581,14 @@ static bool app_init(int argc, char **argv) {
      * line (dev / --check), in which case go straight into that level. */
     menu_init(&g_app.menu);
     menu_load_assets(&g_app.menu, &g_app.archives, &g_app.renderer, g_app.sfx_weapon_switch);
+    /* Menu navigation sounds (blip = move, SELECT = activate). */
+    g_app.menu.sfx_nav    = sfx_load("blip1.wav");
+    g_app.menu.sfx_select = sfx_load("SELECT.wav");
+    g_app.menu.sfx_back   = sfx_load("blip3.wav");
+    /* Apply persisted volumes + difficulty. */
+    audio_set_music_volume(&g_app.audio, settings_gain(&g_settings, VOL_MUSIC));
+    audio_set_sfx_volume(&g_app.audio,   settings_gain(&g_settings, VOL_EFFECTS));
+    g_app.difficulty = g_settings.difficulty;
     campaign_parse();   /* build the story level order from OUTLAWS.RCS */
     /* Go straight into a level only when one was requested on the command line
      * (or --check/--screenshot); otherwise show the front-end menu. */
@@ -2082,12 +2152,42 @@ static void app_run(void) {
         if (g_app.in_menu) {
             g_app.input.suppress_capture = true;        /* don't grab on click */
             input_capture_mouse(&g_app.input, false);   /* free cursor for the menu */
+            /* Populate save slots so LOAD (from the main menu) lists them. */
+            if (g_app.menu.screen == MENU_LOAD || g_app.menu.screen == MENU_SAVE)
+                refresh_save_slots();
             renderer_begin_frame(&g_app.renderer);
             menu_frame(&g_app.menu, &g_app.input, &g_app.renderer, &g_app.audio);
             if (g_app.menu.want_quit) { g_app.running = false; break; }
+            /* VIDEO options: apply a resolution / fullscreen change. */
+            if (g_app.menu.apply_video) {
+                g_app.menu.apply_video = false;
+                apply_video_settings();
+            }
+            /* Persist settings the menu changed (volumes, binds, video, ...). */
+            if (g_app.menu.settings_dirty) {
+                g_app.menu.settings_dirty = false;
+                settings_save(&g_settings);
+            }
+            /* LOAD chosen from the MAIN menu → load the save and enter the game. */
+            if (g_app.menu.req_load_slot >= 0 && g_app.menu.load_return == MENU_MAIN) {
+                int slot = g_app.menu.req_load_slot; g_app.menu.req_load_slot = -1;
+                if (do_load(slot)) {
+                    g_app.in_menu = false;
+                    g_app.menu.screen = MENU_INGAME;
+                    input_capture_mouse(&g_app.input, true);
+                }
+                last_ticks = SDL_GetTicks64();
+                continue;
+            }
             /* STORY → begin the campaign at mission 1. */
             if (g_app.menu.start_story) {
                 g_app.menu.start_story = false;
+                /* Re-parse the main story order — a prior historical mission may
+                 * have overwritten campaign[] with its own .rca. */
+                campaign_parse();
+                /* Apply the difficulty chosen on the DIFFICULTY screen. */
+                g_settings.difficulty = g_app.difficulty = g_app.menu.chosen_difficulty;
+                settings_save(&g_settings);
                 /* Opening cinematic (op_cr.san) before mission 1, Esc to skip. */
                 if (!cutscene_play(g_app.campaign_open_movie)) { g_app.running = false; break; }
                 if (campaign_load(0, false)) {
@@ -2098,10 +2198,45 @@ static void app_run(void) {
                 last_ticks = SDL_GetTicks64();
                 continue;
             }
-            /* MULTIPLAYER / debug poster select → load a single map (no campaign). */
+            /* HISTORICAL MISSION → run its own .rca mini-campaign (e.g. Civil War
+             * chains civlwar1 → civlwar2). Falls back to a single level if there is
+             * no .rca (Marshal Training = htrain). */
+            if (g_app.menu.start_historical) {
+                g_app.menu.start_historical = false;
+                char base[64]; snprintf(base, sizeof(base), "%s", g_app.menu.start_level);
+                g_app.menu.start_level[0] = '\0';
+                g_settings.difficulty = g_app.difficulty = g_app.menu.chosen_difficulty;
+                settings_save(&g_settings);
+                char rca[80]; snprintf(rca, sizeof(rca), "%s.rca", base);
+                bool started = false;
+                if (campaign_parse_rcs(rca) > 0) {           /* multi-level .rca campaign */
+                    g_app.campaign_open_movie[0] = '\0';     /* historical: no opening movie */
+                    if (campaign_load(0, false)) started = true;
+                } else if (load_level_runtime(base)) {       /* single level (no .rca) */
+                    g_app.campaign_active = false;
+                    started = true;
+                } else {
+                    /* base was the .rca stem but no level of that name — rebuild the
+                     * main story RCS so a later STORY start still works. */
+                    campaign_parse();
+                }
+                if (started) {
+                    g_app.in_menu = false;
+                    g_app.menu.screen = MENU_INGAME;
+                    input_capture_mouse(&g_app.input, true);
+                } else {
+                    campaign_parse();   /* restore main story order on failure */
+                }
+                last_ticks = SDL_GetTicks64();
+                continue;
+            }
+            /* MULTIPLAYER / poster → load a single map (no campaign). */
             if (g_app.menu.start_level[0]) {
                 char lvl[64]; snprintf(lvl, sizeof(lvl), "%s", g_app.menu.start_level);
                 g_app.menu.start_level[0] = '\0';
+                /* Apply the chosen difficulty (from the DIFFICULTY screen). */
+                g_settings.difficulty = g_app.difficulty = g_app.menu.chosen_difficulty;
+                settings_save(&g_settings);
                 if (load_level_runtime(lvl)) {
                     g_app.campaign_active = false;
                     g_app.in_menu = false;
@@ -2220,7 +2355,7 @@ static void app_run(void) {
         /* Reload while R is HELD (bullet-by-bullet, faithful): weapon_update runs
          * inside player_update and loads one round per RELOAD_CHOR loop while
          * reload_held is set; releasing R stops it. */
-        g_app.player.weapons.reload_held = input_key_held(game_input, SDL_SCANCODE_R);
+        g_app.player.weapons.reload_held = input_key_held(game_input, (SDL_Scancode)g_settings.bind[BIND_RELOAD]);
         bool fired = player_update(&g_app.player, game_input, dt, sec_friction);
         /* Per-round reload sound (each chambered round). */
         if (g_app.player.weapons.reload_click &&
@@ -2317,8 +2452,28 @@ static void app_run(void) {
              * 2.0 — the crouch-aware fit test is what lets the player crawl
              * under low floors (Sector_CanFitRecursive @0x4e6660). */
             f32 col_h = player_collision_height(pl);
+            Vec3 col_from = pre_move_pos, col_to = pl->pos;
+            /* Swimming at the surface: measure wall step-ups from the water
+             * surface, not the sunk-in feet. A treading player floats with the
+             * feet ~4.5u below the waterline, so every shore would otherwise
+             * read as an unclimbable 4.5u step and you could never get out.
+             * Gated to near-surface only — a deep diver must not clip through
+             * underwater walls. */
+            if (g_app.in_water_prev && pl->sector_idx >= 0 &&
+                pl->sector_idx < (i32)g_app.world.lvt.sector_count &&
+                g_app.world.lvt.sectors[pl->sector_idx].is_water) {
+                f32 wf = 0.0f, wc = 256.0f;
+                collision_heights(&g_app.world.lvt, pl->sector_idx,
+                                  pl->pos.x, pl->pos.z, &wf, &wc);
+                const LvtSector *ws = &g_app.world.lvt.sectors[pl->sector_idx];
+                f32 surf = ws->water_at_ceiling ? wc : wf;
+                if (surf - pl->pos.y <= pl->eye_height) {  /* treading, not deep */
+                    col_from.y = surf;
+                    col_to.y   = surf;
+                }
+            }
             Vec3 resolved = collision_resolve(
-                &g_app.world.lvt, pre_move_pos, pl->pos,
+                &g_app.world.lvt, col_from, col_to,
                 PLAYER_RADIUS, col_h, &pl->sector_idx);
             pl->pos.x = resolved.x;
             pl->pos.z = resolved.z;
@@ -2342,75 +2497,129 @@ static void app_run(void) {
                              g_app.world.lvt.sectors[pl->sector_idx].is_water);
 
             if (in_water) {
-                /* ---- Swimming (Jedi 2-sector water) ----
-                 * The water surface is the water-textured side of the sector:
-                 * the CEILING in the underwater half (real ground floor below),
-                 * else the FLOOR (surface half). The player floats with the eyes
-                 * at the surface and swims up/down with Space/Ctrl; buoyancy eases
-                 * toward the float level, water damps motion, gravity + fall
-                 * damage are suspended. */
+                /* ---- Swimming ----
+                 * A water sector's surface is the water-textured side (the
+                 * CEILING for the underwater half, else the FLOOR); the ground
+                 * is the sector floor. The player treads with the eyes at the
+                 * waterline and swims up (Space) / down (Ctrl); buoyancy eases
+                 * toward the float level; gravity + fall damage are suspended.
+                 * To LEAVE the water you either swim into a low shore (the
+                 * horizontal collision above is measured from the surface, so a
+                 * bank within a step of the waterline is walked onto and the
+                 * ground step-band lifts you out), OR JUMP out at the surface:
+                 * pressing jump launches a self-contained gravity arc (handled
+                 * right here, NOT via the old airborne state machine that caused
+                 * the porpoise-down / fall-through-the-map bugs). */
                 const LvtSector *wsec = &g_app.world.lvt.sectors[pl->sector_idx];
                 bool underwater = wsec->water_at_ceiling;
                 f32 surface = underwater ? ceil_y : floor_y;
-                f32 bottom  = underwater ? floor_y : (surface - PHY_SWIM_DEPTH);
-                if (!g_app.in_water_prev) {   /* entered water: splash, kill fall */
+                /* Diveable bottom = the deepest water floor under this point.
+                 * The surface slab's own floor IS the waterline, so we must look
+                 * through to the deep volume stacked below it; else the player
+                 * would be pinned ON the surface ("walking on water"). Clamped to
+                 * real geometry so diving can't go under the map. */
+                f32 ground = collision_water_bottom_at(&g_app.world.lvt,
+                                                       pl->pos.x, pl->pos.z, surface);
+                if (ground > surface) ground = surface;
+                if (!g_app.in_water_prev) {           /* entered water: splash */
                     if (g_app.sfx_water) audio_play(&g_app.audio, g_app.sfx_water);
                     pl->fall_peak = 0.0f; pl->vel_y = 0.0f;
                 }
-                /* Idle float level: feet so the eyes sit at the waterline (but
-                 * never below the ground in shallow water). */
+                /* Idle float level: feet low enough that the eyes sit at the
+                 * waterline (but never below the ground in shallow water). */
                 f32 float_feet = surface - pl->eye_height + 1.0f;
-                if (float_feet < bottom) float_feet = bottom;
+                if (float_feet < ground) float_feet = ground;
+
                 bool sw_up = input_key_held(&g_app.input, SDL_SCANCODE_SPACE);
                 bool sw_dn = input_key_held(&g_app.input, SDL_SCANCODE_LCTRL) ||
                              input_key_held(&g_app.input, SDL_SCANCODE_RCTRL) ||
-                             input_key_held(&g_app.input, SDL_SCANCODE_C) ||
-                             pl->crouching;   /* crouch key = dive */
-                if (sw_dn) {
-                    pl->vel_y = -PHY_SWIM_VERT;                 /* dive */
-                } else if (sw_up) {
-                    pl->vel_y = PHY_SWIM_VERT;                  /* swim up (hold) */
+                             input_key_held(&g_app.input, SDL_SCANCODE_C);
+
+                if (pl->pos.y > surface + 0.01f) {
+                    /* Breached the surface (mid leap-out): a plain gravity arc,
+                     * no swim control. Uses AIR gravity (-60), NOT the buoyant
+                     * water-volume gravity (-10) of the current sector — else the
+                     * jump-out floats up ~20u over 2s ("low-gravity fly"). When it
+                     * drops back to the waterline the swim path below resumes; if
+                     * a bank was reached the sector flips to non-water and the
+                     * airborne branch lands the jump. Bounded above the surface
+                     * → can never drive under the map. */
+                    pl->vel_y += PHY_AIR_GRAVITY * dt;
+                    pl->pos.y += pl->vel_y * dt;
+                    if (pl->pos.y <= surface) {   /* fell back into the water */
+                        pl->pos.y = surface;
+                        pl->vel_y = 0.0f;
+                    }
+                    pl->on_ground = false;
+                    pl->want_jump = false;
+                    /* g_app.was_airborne stays true so a bank landing is handled
+                     * by the airborne branch once in_water turns false. */
                 } else {
-                    /* Buoyancy: ease to the treading float level (never sinks on
-                     * its own, never overshoots). */
-                    f32 d = float_feet - pl->pos.y;
-                    pl->vel_y = OL_CLAMP(d * 5.0f, -PHY_SWIM_VERT, PHY_SWIM_VERT);
+                    /* Jump out of the water: a tap of jump at the surface, or
+                     * holding it while swimming at a shore, launches from the
+                     * waterline (a jump from the treading depth ~4.5u under never
+                     * even breaches). Eye compensated so the snap isn't a pop. */
+                    f32 hspeed2 = pl->vel.x * pl->vel.x + pl->vel.z * pl->vel.z;
+                    bool near_surf = pl->pos.y >= surface - pl->eye_height;
+                    bool leap = near_surf &&
+                                (pl->want_jump || (sw_up && hspeed2 > 4.0f));
+                    if (leap) {
+                        f32 intent = pl->running ? PHY_RUN_MULT : 1.0f;
+                        pl->eye_step_ofs += (pl->pos.y - surface);
+                        pl->pos.y = surface;
+                        pl->vel_y = PHY_JUMP_VEL *
+                                    (1.0f + (intent - 1.0f) * pl->energy * 0.01f);
+                        pl->pos.y += pl->vel_y * dt;      /* begin the arc */
+                        g_app.was_airborne = true;
+                        pl->on_ground = false;
+                        if (g_app.sfx_water) audio_play(&g_app.audio, g_app.sfx_water);
+                    } else {
+                        if (sw_up) {
+                            pl->vel_y = PHY_SWIM_VERT;             /* swim up */
+                        } else if (sw_dn) {
+                            pl->vel_y = -PHY_SWIM_VERT;            /* dive */
+                        } else {
+                            f32 d = float_feet - pl->pos.y;        /* buoyancy */
+                            pl->vel_y = OL_CLAMP(d * 4.0f, -PHY_SWIM_VERT, PHY_SWIM_VERT);
+                        }
+                        pl->pos.y += pl->vel_y * dt;
+                        /* Surface cap: swimming tops out at the waterline. */
+                        if (pl->pos.y > surface) { pl->pos.y = surface; if (pl->vel_y > 0) pl->vel_y = 0; }
+                        if (pl->pos.y < ground)  { pl->pos.y = ground;  if (pl->vel_y < 0) pl->vel_y = 0; }
+                        pl->on_ground = false;
+                        g_app.was_airborne = false;
+                    }
+                    pl->want_jump = false;
                 }
-                pl->pos.y += pl->vel_y * dt;
-                /* Surface cap: can't swim up into the air above the water. */
-                if (pl->pos.y > surface) { pl->pos.y = surface; if (pl->vel_y > 0) pl->vel_y = 0; }
-                /* Ground bottom: can't sink through the floor. */
-                if (pl->pos.y < bottom)  { pl->pos.y = bottom;  if (pl->vel_y < 0) pl->vel_y = 0; }
                 /* Water drag on horizontal motion (slower swimming). */
                 pl->vel.x -= pl->vel.x * PHY_SWIM_DAMP * dt;
                 pl->vel.z -= pl->vel.z * PHY_SWIM_DAMP * dt;
-                pl->on_ground = false;
-                pl->want_jump = false;
-                g_app.was_airborne = false;
             } else {
-            /* Vertical physics (Physics_ApplyGravityStep @0x4e05e0): gravity
-             * applies only when the feet are more than STEP_HEIGHT above the
-             * floor or already moving vertically; within the band the player
-             * is grounded and snapped (stairs don't enter fall state). */
-            bool in_band = (pl->pos.y - floor_y) <= PHY_STEP_HEIGHT;
-            if (!in_band || pl->vel_y > 0.0f) {
+            /* Supporting floor = the HIGHEST floor the player's radius overlaps
+             * (Sector_CanFitRecursive), not just the floor under the center. This
+             * keeps the player standing on narrow wall-tops/murets and lifts them
+             * onto low walls as they approach, instead of sliding off. */
+            floor_y = collision_support_floor(&g_app.world.lvt, pl->pos.x, pl->pos.z,
+                                              pl->pos.y, PLAYER_RADIUS, pl->sector_idx, col_h);
+            /* Vertical physics (Physics_ApplyGravityStep @0x4e05e0). Two
+             * regimes:
+             *  - AIRBORNE (jumped, or walked off a ledge taller than a step):
+             *    gravity integrates the full arc down until the feet reach the
+             *    floor, THEN we land. The step band must NOT cut the descent
+             *    short — otherwise a short jump (apex ~3.3u, just over the 3u
+             *    band) snaps straight back to the floor the instant it starts
+             *    falling ("instant return to ground at the apex").
+             *  - GROUNDED: the STEP_HEIGHT band glues the player to the floor
+             *    so small steps/stairs are walked (not fallen); a drop bigger
+             *    than a step starts a fall. */
+            if (g_app.was_airborne) {
                 pl->vel_y += sec_gravity * dt;
                 pl->pos.y += pl->vel_y * dt;
-                pl->on_ground = false;
-                g_app.was_airborne = true;
                 if (-pl->vel_y > pl->fall_peak) pl->fall_peak = -pl->vel_y;
-            }
-            if ((pl->pos.y - floor_y) <= PHY_STEP_HEIGHT && pl->vel_y <= 0.0f) {
-                /* Land / stay grounded. Step delta feeds the eye smoothing
-                 * (STEP_SPEED easing = the smooth stair feel, @0x444056). */
-                f32 drop = pl->pos.y - floor_y;
-                if (fabsf(drop) > 0.01f && fabsf(drop) <= PHY_STEP_HEIGHT &&
-                    !g_app.was_airborne)
-                    pl->eye_step_ofs += drop;
-                pl->pos.y = floor_y;
-                if (g_app.was_airborne) {
-                    /* Landing: sounds + fall damage (Player_TakeDamage
-                     * @0x445920: dmg = (speed-45)*0.2 above 45 u/s). */
+                if (pl->pos.y <= floor_y && pl->vel_y <= 0.0f) {
+                    /* Reached the floor — land. Sounds + fall damage
+                     * (Player_TakeDamage @0x445920: dmg=(speed-45)*0.2). */
+                    pl->pos.y = floor_y;
                     if (pl->fall_peak >= PHY_LAND_LIGHT)
                         audio_play(&g_app.audio, g_app.sfx_player_land);
                     if (pl->fall_peak > PHY_FALL_DMG_SPEED) {
@@ -2418,11 +2627,34 @@ static void app_run(void) {
                                         * PHY_FALL_DMG_SCALE + 0.5f);
                         if (dmg > 0) player_damage(pl, dmg);
                     }
+                    pl->vel_y = 0.0f;
+                    pl->on_ground = true;
+                    pl->fall_peak = 0.0f;
                     g_app.was_airborne = false;
+                } else {
+                    pl->on_ground = false;
                 }
-                pl->vel_y = 0.0f;
-                pl->on_ground = true;
-                pl->fall_peak = 0.0f;
+            } else {
+                f32 above = pl->pos.y - floor_y;
+                if (above > PHY_STEP_HEIGHT) {
+                    /* Walked off a ledge taller than a step → begin falling. */
+                    pl->vel_y += sec_gravity * dt;
+                    pl->pos.y += pl->vel_y * dt;
+                    pl->on_ground = false;
+                    g_app.was_airborne = true;
+                    if (-pl->vel_y > pl->fall_peak) pl->fall_peak = -pl->vel_y;
+                } else {
+                    /* Stay grounded: step up/down within the band. The step
+                     * delta feeds the eye smoothing (STEP_SPEED easing = the
+                     * smooth stair feel, @0x444056). */
+                    f32 drop = pl->pos.y - floor_y;
+                    if (fabsf(drop) > 0.01f && fabsf(drop) <= PHY_STEP_HEIGHT)
+                        pl->eye_step_ofs += drop;
+                    pl->pos.y = floor_y;
+                    pl->vel_y = 0.0f;
+                    pl->on_ground = true;
+                    pl->fall_peak = 0.0f;
+                }
             }
 
             /* Ceiling bump (@0x4449e9): head = feet + eye + HEAD_HEIGHT —
@@ -2597,7 +2829,7 @@ static void app_run(void) {
             }
 
             /* Rifle scope toggle (V): no aim error, full-range traces, zoom. */
-            if (!ui_open && input_key_pressed(&g_app.input, SDL_SCANCODE_V) && wdef->has_scope) {
+            if (!ui_open && input_key_pressed(&g_app.input, (SDL_Scancode)g_settings.bind[BIND_SCOPE]) && wdef->has_scope) {
                 ws->scope_active = !ws->scope_active;
                 renderer_set_zoom(&g_app.renderer, ws->scope_active ? 2.0f : 1.0f);
             }
@@ -2609,7 +2841,7 @@ static void app_run(void) {
         /* (Reload is driven by the reload_held flag set before player_update —
          * hold R to chamber rounds one at a time; see above.) */
         /* Automap overlay toggle (TAB) */
-        if (!g_debug.visible && input_key_pressed(&g_app.input, SDL_SCANCODE_TAB))
+        if (!g_debug.visible && input_key_pressed(&g_app.input, (SDL_Scancode)g_settings.bind[BIND_MAP]))
             g_app.show_map = !g_app.show_map;
         /* Advance fire animation */
         if (g_app.player.fire_anim) {
@@ -2653,7 +2885,7 @@ static void app_run(void) {
 
         /* USE key (E): open the door in front (with lock/key check), fire NUDGE
          * triggers, in the current and adjacent sectors. */
-        if (input_key_pressed(&g_app.input, SDL_SCANCODE_E) || g_app.force_use) {
+        if (input_key_pressed(&g_app.input, (SDL_Scancode)g_settings.bind[BIND_USE]) || g_app.force_use) {
             int si = g_app.player.sector_idx;
             {
                 int needed = INF_KEY_NONE;

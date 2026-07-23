@@ -13,8 +13,10 @@
 
 /* Player capsule radius */
 #define PLAYER_RADIUS       1.5f
-/* Maximum step-up height — air.phy STEP_HEIGHT = 3.0 */
-#define COL_STEP_HEIGHT     3.5f   /* Outlaws PLAYER_STEP = 0x38000 = 3.5 units */
+/* Maximum step-up height. RE-verified: AIR.PHY / WATER.PHY / DEFAULT.PHY all
+ * carry STEP_HEIGHT: 3.0, and the engine's wall-cross test (FUN_004de6d0) blocks
+ * only when (dest_floor - feet) > STEP_HEIGHT. Matches PHY_STEP_HEIGHT (player.h). */
+#define COL_STEP_HEIGHT     3.0f
 
 /*
  * Find the sector index that contains 2D point (x, z).
@@ -47,6 +49,17 @@ void collision_heights(const LvtLevel *level, int sector_idx, f32 x, f32 z,
  * height? (Exposes the internal wall solidity test for the door test harness.) */
 bool collision_wall_is_solid(const LvtLevel *level, int si, int wi,
                              f32 y, f32 height);
+
+/* Deepest water floor at (x,z) — the bottom of the water column under the
+ * player, across the two stacked (overlapping) water sectors. Returns
+ * `fallback` when there is no deeper water below the point. */
+f32 collision_water_bottom_at(const LvtLevel *level, f32 x, f32 z, f32 fallback);
+
+/* Highest floor the player's radius-circle overlaps (center sector + reachable
+ * neighbours), bounded to within a step of `feet`. Lets the player stand on and
+ * step onto narrow wall-tops/murets instead of sliding off (Sector_CanFitRecursive). */
+f32 collision_support_floor(const LvtLevel *level, f32 x, f32 z, f32 feet,
+                            f32 radius, int center, f32 height);
 
 /*
  * 2D line-of-sight check through sector portals.

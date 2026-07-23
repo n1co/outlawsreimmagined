@@ -26,8 +26,71 @@ static bool point_in_sector(const LvtSector *sec, f32 x, f32 z) {
     return (crossings & 1) != 0;
 }
 
+/* Deepest water floor at (x,z): the bottom of the water column under the player.
+ * Outlaws water is two stacked, x/z-overlapping sectors — a thin surface slab
+ * (floor = waterline) directly above a deep volume (ceiling = waterline). They
+ * are NOT wall-adjoined, so to know how deep the player may sink we scan every
+ * water sector whose polygon contains (x,z) and take the lowest floor. Returns
+ * `fallback` (the surface) when there is no deeper water below (a shallow slab
+ * you just wade on). */
+f32 collision_water_bottom_at(const LvtLevel *level, f32 x, f32 z, f32 fallback) {
+    if (!level) return fallback;
+    f32 bottom = fallback;
+    for (u32 i = 0; i < level->sector_count; i++) {
+        const LvtSector *s = &level->sectors[i];
+        if (!s->is_water) continue;
+        f32 f = lvt_floor_at(s, x, z);
+        if (f < bottom && point_in_sector(s, x, z)) bottom = f;
+    }
+    return bottom;
+}
+
 /* Forward declaration */
 static bool wall_is_solid(const LvtLevel *level, i32 si, u32 wi, f32 y, f32 height);
+
+/* Squared distance from point (px,pz) to segment (ax,az)-(bx,bz). */
+static f32 point_seg_dist2(f32 px, f32 pz, f32 ax, f32 az, f32 bx, f32 bz) {
+    f32 dx = bx - ax, dz = bz - az;
+    f32 l2 = dx*dx + dz*dz;
+    f32 t = (l2 > 1e-8f) ? ((px-ax)*dx + (pz-az)*dz) / l2 : 0.0f;
+    if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
+    f32 cx = ax + t*dx, cz = az + t*dz;
+    f32 ex = px - cx, ez = pz - cz;
+    return ex*ex + ez*ez;
+}
+
+/* Supporting floor for a player of `radius` at (x,z) with feet at `feet`.
+ * Outlaws (Sector_CanFitRecursive @0x4e6660 / Wall_CircleIntersects) stands the
+ * player on the HIGHEST floor any part of their radius-circle overlaps — not the
+ * floor under their center point. This is what lets you stand on and walk along
+ * a wall-top / muret only ~1u wide (the cylinder is 3u across) instead of sliding
+ * off the instant your center leaves it, and what smoothly lifts you onto a low
+ * wall as you approach. Bounded to floors within STEP_HEIGHT of the feet (a floor
+ * higher than that is a wall you can't be standing on). Considers the center
+ * sector and each neighbour whose shared wall the circle reaches through a
+ * passable (non-solid) portal. */
+f32 collision_support_floor(const LvtLevel *level, f32 x, f32 z, f32 feet,
+                            f32 radius, int center, f32 height) {
+    if (!level || center < 0 || center >= (i32)level->sector_count) return feet;
+    const LvtSector *c = &level->sectors[center];
+    f32 best  = lvt_floor_at(c, x, z);
+    f32 limit = feet + COL_STEP_HEIGHT;
+    f32 r2    = radius * radius;
+    for (u32 wi = 0; wi < c->wall_count; wi++) {
+        const LvtWall *w = &c->walls[wi];
+        i32 adj = w->adjoin;
+        if (adj < 0 || adj >= (i32)level->sector_count) continue;
+        if (w->v1 < 0 || w->v2 < 0 ||
+            w->v1 >= (i32)c->vertex_count || w->v2 >= (i32)c->vertex_count) continue;
+        f32 ax = c->vertices[w->v1].x, az = c->vertices[w->v1].y;
+        f32 bx = c->vertices[w->v2].x, bz = c->vertices[w->v2].y;
+        if (point_seg_dist2(x, z, ax, az, bx, bz) > r2) continue;   /* circle can't reach it */
+        if (wall_is_solid(level, center, wi, feet, height)) continue; /* solid → not standable across */
+        f32 af = lvt_floor_at(&level->sectors[adj], x, z);
+        if (af <= limit && af > best) best = af;
+    }
+    return best;
+}
 
 int collision_find_sector(const LvtLevel *level, f32 x, f32 z, int hint) {
     return collision_find_sector_y(level, x, z, -9999.0f, 0.0f, hint);
@@ -293,10 +356,18 @@ static bool wall_is_solid(const LvtLevel *level, i32 si, u32 wi,
     if (headroom < 0.0f)
         return true;
 
-    /* Step-up check. Arches are already handled by ADJOIN_MID+dadjoin above.
-     * No "walk under" exception needed here — just block if step too high. */
-    f32 step_up = adj_floor - y;
-    if (step_up > COL_STEP_HEIGHT)
+    /* Step-up check. A wall is a climbable step if the far floor is within
+     * STEP_HEIGHT of EITHER the player's feet OR THIS sector's floor at the
+     * crossing. The sector-floor test is what makes staircases work: the real
+     * engine (Physics_SlideMove) subdivides the move and raises the feet onto
+     * each step as it crosses, so the next riser is always measured from the
+     * step you're standing on — not your global feet Y. Without it, the player
+     * radius (1.5) overlaps steps two/three ahead whose risers, measured from
+     * the low starting floor, exceed STEP and wall the player in place.
+     * The feet-Y test is still needed so you can land on a ledge mid-jump. */
+    f32 step_up      = adj_floor - y;
+    f32 step_up_sec  = adj_floor - sec_floor;
+    if (step_up > COL_STEP_HEIGHT && step_up_sec > COL_STEP_HEIGHT)
         return true;
 
     return false;
